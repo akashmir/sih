@@ -15,8 +15,9 @@ from backend.main import app
 
 
 @pytest.fixture
-def client():
-    """Create test client with lifespan triggered."""
+def client(tmp_path, monkeypatch):
+    """Create test client with lifespan triggered, backed by throwaway databases."""
+    monkeypatch.setenv("NISHAN_DATA_DIR", str(tmp_path))
     with TestClient(app) as c:
         yield c
 
@@ -265,3 +266,102 @@ def test_ledger_verify_endpoint(client):
 
 
 
+
+
+def _register(client, user_id):
+    response = client.post(
+        "/api/users/register",
+        data={"user_id": user_id, "display_name": user_id},
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
+def _decrypt(client, doc_id, user_id, bundle):
+    return client.post(
+        "/api/documents/decrypt",
+        data={"doc_id": doc_id, "user_id": user_id},
+        files={"key_file": ("key.json", io.BytesIO(json.dumps(bundle).encode()), "application/json")},
+    )
+
+
+def test_encrypt_rejects_unsupported_format(client):
+    """Formats that can't be watermarked are refused at distribution time."""
+    _register(client, "fmt_user")
+    response = client.post(
+        "/api/documents/encrypt",
+        files={"document": ("report.docx", b"PK\x03\x04binary", "application/octet-stream")},
+        data={"recipients": "fmt_user"},
+    )
+    assert response.status_code == 415
+
+
+def test_register_rejects_bad_user_id(client):
+    """User IDs are restricted to a safe character set."""
+    response = client.post(
+        "/api/users/register",
+        data={"user_id": "bad id\r\nX-Evil: 1", "display_name": "Bad"},
+    )
+    assert response.status_code == 400
+
+
+def test_documents_persist_across_restart(tmp_path, monkeypatch):
+    """Encrypted documents survive a server restart."""
+    monkeypatch.setenv("NISHAN_DATA_DIR", str(tmp_path))
+    with TestClient(app) as c:
+        bundle = _register(c, "persist_user")
+        doc_id = c.post(
+            "/api/documents/encrypt",
+            files={"document": ("memo.txt", b"Persist me\nplease", "text/plain")},
+            data={"recipients": "persist_user"},
+        ).json()["doc_id"]
+
+    with TestClient(app) as c:
+        assert doc_id in [d["doc_id"] for d in c.get("/api/documents").json()]
+        response = _decrypt(c, doc_id, "persist_user", bundle)
+        assert response.status_code == 200
+        assert b"Persist me" in response.content
+
+
+def test_decrypt_non_ascii_filename_and_ledger_fields(client):
+    """Unicode filenames download safely; the ledger records doc_id."""
+    bundle = _register(client, "uni_user")
+    doc_id = client.post(
+        "/api/documents/encrypt",
+        files={"document": ("रिपोर्ट.txt", "गोपनीय\nदस्तावेज़".encode(), "text/plain")},
+        data={"recipients": "uni_user"},
+    ).json()["doc_id"]
+
+    response = _decrypt(client, doc_id, "uni_user", bundle)
+    assert response.status_code == 200
+    assert "filename*=UTF-8''" in response.headers["content-disposition"]
+
+    blocks = client.get("/api/ledger/blocks").json()["blocks"]
+    assert blocks[0]["doc_id"] == doc_id
+    assert blocks[0]["watermark_timestamp"] > 0
+
+    result = client.post(
+        "/api/forensics/investigate",
+        files={"document": ("leak.txt", response.content, "text/plain")},
+    ).json()
+    assert result["attribution"]["signature_verified"] is True
+    assert result["attribution"]["watermark_consistent"] is True
+    assert result["attribution"]["doc_id"] == doc_id
+
+
+def test_jpeg_download_named_png(client):
+    """A JPEG source is delivered as PNG with a matching filename."""
+    from PIL import Image
+    bundle = _register(client, "jpg_user")
+    buf = io.BytesIO()
+    Image.new('RGB', (60, 40), color=(90, 120, 150)).save(buf, format='JPEG')
+    doc_id = client.post(
+        "/api/documents/encrypt",
+        files={"document": ("photo.jpg", buf.getvalue(), "image/jpeg")},
+        data={"recipients": "jpg_user"},
+    ).json()["doc_id"]
+
+    response = _decrypt(client, doc_id, "jpg_user", bundle)
+    assert response.status_code == 200
+    assert response.content.startswith(b"\x89PNG")
+    assert 'filename="decrypted_photo.png"' in response.headers["content-disposition"]

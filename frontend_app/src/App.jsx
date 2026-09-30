@@ -13,6 +13,17 @@ async function api(path, opts = {}) {
   return opts.raw ? res : res.json()
 }
 
+// Filename from a Content-Disposition header, preferring the RFC 5987 form
+function dispositionFilename(header, fallback) {
+  if (!header) return fallback
+  const star = header.match(/filename\*=UTF-8''([^;]+)/i)
+  if (star) {
+    try { return decodeURIComponent(star[1]) } catch { /* fall through */ }
+  }
+  const plain = header.match(/filename="?([^";]+)"?/i)
+  return plain ? plain[1] : fallback
+}
+
 // ─── Dashboard ──────────────────────────────────────────────────────
 function Dashboard() {
   const [info, setInfo] = useState(null)
@@ -215,7 +226,7 @@ function Distribute() {
             <input type="file" onChange={e => setFile(e.target.files[0])} />
             <div className="icon">📁</div>
             <div className="label">{file ? file.name : 'Click to select a document'}</div>
-            <div className="sublabel">Supported: .txt, .md, .pdf, .png, .jpg</div>
+            <div className="sublabel">Supported: .txt, .md, .csv, .json, .xml, .html, .log, .pdf, .png, .jpg, .bmp</div>
           </div>
         </div>
 
@@ -287,8 +298,7 @@ function Decrypt() {
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      const cd = res.headers.get('Content-Disposition')
-      a.download = cd?.split('filename=')[1] || 'decrypted_document'
+      a.download = dispositionFilename(res.headers.get('Content-Disposition'), 'decrypted_document')
       a.click()
       URL.revokeObjectURL(url)
 
@@ -425,6 +435,10 @@ function Investigate() {
             <div className="result-row">
               <span className="label">Signature Status</span>
               <span>{result.attribution.signature_verified ? <span className="badge-valid">✓ Verified</span> : <span className="badge-invalid">✗ Unverified</span>}</span>
+            </div>
+            <div className="result-row">
+              <span className="label">Watermark ↔ Ledger</span>
+              <span>{result.attribution.watermark_consistent ? <span className="badge-valid">✓ Consistent</span> : <span className="badge-invalid">✗ Mismatch</span>}</span>
             </div>
 
             <h4 style={{ marginTop: 20 }}>Ledger Proof</h4>

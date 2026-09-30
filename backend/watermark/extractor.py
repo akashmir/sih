@@ -7,6 +7,7 @@ using majority-vote decoding for error resilience.
 
 import io
 import os
+import re
 import struct
 from typing import Optional
 
@@ -19,10 +20,11 @@ from .encoder import (
     decode_redundancy,
     bits_to_bytes,
     bytes_to_payload,
-    ZW_ZERO,
-    ZW_ONE,
-    ZW_DELIM,
+    is_valid_payload,
 )
+from .embedder import PDF_TEXT_MARKER, IMAGE_EXTENSIONS
+
+_PDF_MARKER_RE = re.compile(re.escape(PDF_TEXT_MARKER) + r"\s*([0-9a-f]{100})")
 
 
 def extract_from_text(content: bytes) -> Optional[WatermarkPayload]:
@@ -80,7 +82,8 @@ def extract_from_image(image_data: bytes) -> Optional[WatermarkPayload]:
         payload_bits = decoded[32:32 + payload_length * 8]
         raw_bytes = bits_to_bytes(payload_bits)
 
-        return bytes_to_payload(raw_bytes[:50])
+        payload = bytes_to_payload(raw_bytes[:50])
+        return payload if is_valid_payload(payload) else None
 
     except Exception:
         return None
@@ -112,9 +115,17 @@ def extract_from_pdf(pdf_data: bytes) -> Optional[WatermarkPayload]:
                     doc.close()
                     return payload
 
-        # Strategy 3: Check all text on all pages
+        # Strategy 3: Invisible hex text layer (or ZW chars) on any page
         for page in doc:
             text = page.get_text()
+            for match in _PDF_MARKER_RE.finditer(text):
+                try:
+                    payload = bytes_to_payload(bytes.fromhex(match.group(1)))
+                except ValueError:
+                    continue
+                if is_valid_payload(payload):
+                    doc.close()
+                    return payload
             payload = decode_from_text(text)
             if payload:
                 doc.close()
@@ -141,11 +152,15 @@ def extract_watermark(
     Returns:
         WatermarkPayload if found, None otherwise
     """
-    ext = os.path.splitext(filename)[1].lower()
+    # Sniff the content first: a leaked file may have been renamed.
+    if document_data.startswith(b'%PDF'):
+        return extract_from_pdf(document_data)
+    if document_data.startswith((b'\x89PNG', b'\xff\xd8\xff', b'BM')):
+        return extract_from_image(document_data)
 
-    if ext in ('.png', '.jpg', '.jpeg', '.bmp'):
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in IMAGE_EXTENSIONS:
         return extract_from_image(document_data)
     elif ext == '.pdf':
         return extract_from_pdf(document_data)
-    else:
-        return extract_from_text(document_data)
+    return extract_from_text(document_data)

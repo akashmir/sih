@@ -48,6 +48,24 @@ cd ..
 python -m uvicorn backend.main:app --reload --port 8000
 ```
 
+By default this runs with **classical** crypto (X25519 + Ed25519). For post-quantum
+ML-KEM-768 / ML-DSA-65, install the native [liboqs](https://github.com/open-quantum-safe/liboqs)
+library and `pip install liboqs-python`. The Dashboard shows which backend is active.
+Key files are tied to the backend they were generated with, so re-register users after switching.
+
+Configuration (environment variables):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `NISHAN_DATA_DIR` | `backend/data` | Where the SQLite databases live |
+| `NISHAN_CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Allowed browser origins |
+
+### Tests
+```bash
+python -m pytest backend/tests
+```
+Tests use throwaway databases and never touch `backend/data`.
+
 ### Frontend
 ```bash
 cd frontend_app
@@ -70,23 +88,32 @@ Open http://localhost:5173
 | Component | Technology |
 |-----------|-----------|
 | Backend | Python 3.11 + FastAPI |
-| PQ Crypto | ML-KEM-768, ML-DSA-65 (via liboqs / classical fallback) |
+| PQ Crypto | ML-KEM-768, ML-DSA-65 via liboqs-python (optional; X25519/Ed25519 fallback) |
 | Symmetric | AES-256-GCM |
-| Watermark | Zero-width chars (text), LSB steganography (images), PDF annotations |
+| Watermark | Zero-width chars (text), LSB steganography (images), PDF metadata + annotation + invisible text layer |
 | Ledger | SHA-256 hash chain, SQLite |
+| Storage | Encrypted documents persisted in SQLite |
 | Frontend | React + Vite |
 
 ## Supported Formats
-- Plain text (`.txt`, `.md`, `.csv`)
-- PDF documents (`.pdf`)
-- Images (`.png`, `.jpg`)
+- UTF-8 text (`.txt`, `.md`, `.csv`, `.json`, `.xml`, `.html`, `.log`)
+- PDF documents (`.pdf`) — watermark on every page
+- Images (`.png`, `.jpg`, `.jpeg`, `.bmp`) — watermarked copies are always delivered as PNG
+
+Other formats (e.g. `.docx`, `.xlsx`) are rejected at upload, since they can't be watermarked without corrupting them.
 
 ## Security Properties
-- ✅ Client-held private keys (server never stores them)
-- ✅ Non-repudiation via digital signatures
-- ✅ Tamper-evident ledger (any edit breaks hash chain)
+- ✅ Server never *stores* private keys — they're returned once as a `.key` file
+- ✅ Tamper-evident ledger (any edit breaks hash chain); each block binds the recipient, document and watermark
+- ✅ Watermarks carry a checksum and are cross-checked against the ledger during investigation
 - ✅ Fully offline / air-gapped (no network dependencies)
 - ✅ 3x repetition coding for watermark resilience
+
+### Known limitations
+- **Private keys pass through the server.** Keys are generated server-side at registration, and the `.key` file is uploaded to decrypt. The server therefore performs the signing, which weakens non-repudiation. Moving key generation and decryption into the client is the proper fix.
+- **No authentication.** Anyone who can reach the API can register users and list documents; decryption requires the recipient's `.key` file, which is stored unencrypted.
+- **Ledger can be rewritten by a DB admin.** The chain detects edits, but someone with write access can recompute every hash. Anchoring the latest block hash externally (e.g. printed or signed) closes this.
+- **Watermarks are fragile.** Stripping zero-width characters removes text watermarks; re-saving an image as JPEG, or cropping it, destroys the LSB watermark.
 
 ## API Endpoints
 

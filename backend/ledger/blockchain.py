@@ -8,6 +8,7 @@ stored in SQLite. No external dependencies, fully air-gapped.
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 import os
 from dataclasses import dataclass, asdict
@@ -28,6 +29,31 @@ class LedgerBlock:
     sig_algorithm: str
     prev_hash: str
     block_hash: str
+    # Fields the decryption signature covers. Empty/0 on blocks written
+    # before they were recorded (those are hashed without them).
+    doc_id: str = ""
+    watermark_timestamp: int = 0
+
+
+_COLUMNS = (
+    "block_index, timestamp, watermark_id, recipient_id, document_hash, "
+    "signature, sig_algorithm, prev_hash, block_hash, doc_id, watermark_timestamp"
+)
+
+
+def _block_data(block: "LedgerBlock") -> str:
+    """Canonical JSON of a block's hashed payload."""
+    fields = {
+        "watermark_id": block.watermark_id,
+        "recipient_id": block.recipient_id,
+        "document_hash": block.document_hash,
+        "signature": block.signature,
+        "sig_algorithm": block.sig_algorithm,
+    }
+    if block.doc_id:
+        fields["doc_id"] = block.doc_id
+        fields["watermark_timestamp"] = block.watermark_timestamp
+    return json.dumps(fields, sort_keys=True)
 
 
 def _compute_hash(block_index: int, timestamp: float, data: str, prev_hash: str) -> str:
@@ -43,6 +69,7 @@ class HashChainLedger:
         self.db_path = db_path or os.path.abspath(DB_PATH)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._lock = threading.Lock()
         self._init_db()
 
     def _init_db(self):
@@ -57,9 +84,21 @@ class HashChainLedger:
                 signature TEXT NOT NULL,
                 sig_algorithm TEXT NOT NULL,
                 prev_hash TEXT NOT NULL,
-                block_hash TEXT NOT NULL UNIQUE
+                block_hash TEXT NOT NULL UNIQUE,
+                doc_id TEXT NOT NULL DEFAULT '',
+                watermark_timestamp INTEGER NOT NULL DEFAULT 0
             )
         ''')
+        # Migrate ledgers created before doc_id/watermark_timestamp existed
+        existing = {row[1] for row in self.conn.execute('PRAGMA table_info(blocks)')}
+        if 'doc_id' not in existing:
+            self.conn.execute(
+                "ALTER TABLE blocks ADD COLUMN doc_id TEXT NOT NULL DEFAULT ''"
+            )
+        if 'watermark_timestamp' not in existing:
+            self.conn.execute(
+                "ALTER TABLE blocks ADD COLUMN watermark_timestamp INTEGER NOT NULL DEFAULT 0"
+            )
         self.conn.execute('''
             CREATE INDEX IF NOT EXISTS idx_watermark_id
             ON blocks (watermark_id)
@@ -73,7 +112,7 @@ class HashChainLedger:
     def _get_latest_block(self) -> Optional[LedgerBlock]:
         """Get the most recent block."""
         row = self.conn.execute(
-            'SELECT * FROM blocks ORDER BY block_index DESC LIMIT 1'
+            f'SELECT {_COLUMNS} FROM blocks ORDER BY block_index DESC LIMIT 1'
         ).fetchone()
         if row is None:
             return None
@@ -91,6 +130,8 @@ class HashChainLedger:
         document_hash: str,
         signature: str,
         sig_algorithm: str,
+        doc_id: str = "",
+        watermark_timestamp: int = 0,
     ) -> LedgerBlock:
         """
         Add a new decryption record to the hash chain.
@@ -101,53 +142,47 @@ class HashChainLedger:
             document_hash: SHA-256 of the original document
             signature: Base64-encoded digital signature
             sig_algorithm: Algorithm used for signing
+            doc_id: Document the decryption was for (covered by the signature)
+            watermark_timestamp: Watermark timestamp (covered by the signature)
 
         Returns:
             The newly created LedgerBlock
         """
-        latest = self._get_latest_block()
-        block_index = (latest.block_index + 1) if latest else 0
-        prev_hash = latest.block_hash if latest else ("0" * 64)
-        timestamp = time.time()
+        # Serialize read-latest + insert so concurrent requests can't fork the chain
+        with self._lock:
+            latest = self._get_latest_block()
+            block = LedgerBlock(
+                block_index=(latest.block_index + 1) if latest else 0,
+                timestamp=time.time(),
+                watermark_id=watermark_id,
+                recipient_id=recipient_id,
+                document_hash=document_hash,
+                signature=signature,
+                sig_algorithm=sig_algorithm,
+                prev_hash=latest.block_hash if latest else ("0" * 64),
+                block_hash="",
+                doc_id=doc_id,
+                watermark_timestamp=watermark_timestamp,
+            )
+            block.block_hash = _compute_hash(
+                block.block_index, block.timestamp, _block_data(block), block.prev_hash
+            )
 
-        data = json.dumps({
-            "watermark_id": watermark_id,
-            "recipient_id": recipient_id,
-            "document_hash": document_hash,
-            "signature": signature,
-            "sig_algorithm": sig_algorithm,
-        }, sort_keys=True)
-
-        block_hash = _compute_hash(block_index, timestamp, data, prev_hash)
-
-        block = LedgerBlock(
-            block_index=block_index,
-            timestamp=timestamp,
-            watermark_id=watermark_id,
-            recipient_id=recipient_id,
-            document_hash=document_hash,
-            signature=signature,
-            sig_algorithm=sig_algorithm,
-            prev_hash=prev_hash,
-            block_hash=block_hash,
-        )
-
-        self.conn.execute(
-            '''INSERT INTO blocks
-               (block_index, timestamp, watermark_id, recipient_id,
-                document_hash, signature, sig_algorithm, prev_hash, block_hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (block.block_index, block.timestamp, block.watermark_id,
-             block.recipient_id, block.document_hash, block.signature,
-             block.sig_algorithm, block.prev_hash, block.block_hash),
-        )
-        self.conn.commit()
+            self.conn.execute(
+                f'''INSERT INTO blocks ({_COLUMNS})
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (block.block_index, block.timestamp, block.watermark_id,
+                 block.recipient_id, block.document_hash, block.signature,
+                 block.sig_algorithm, block.prev_hash, block.block_hash,
+                 block.doc_id, block.watermark_timestamp),
+            )
+            self.conn.commit()
         return block
 
     def find_by_watermark(self, watermark_id: str) -> Optional[LedgerBlock]:
         """Look up a block by watermark ID."""
         row = self.conn.execute(
-            'SELECT * FROM blocks WHERE watermark_id = ?',
+            f'SELECT {_COLUMNS} FROM blocks WHERE watermark_id = ?',
             (watermark_id,),
         ).fetchone()
         if row is None:
@@ -157,7 +192,7 @@ class HashChainLedger:
     def find_by_recipient(self, recipient_id: str) -> List[LedgerBlock]:
         """Find all blocks for a given recipient."""
         rows = self.conn.execute(
-            'SELECT * FROM blocks WHERE recipient_id = ? ORDER BY block_index',
+            f'SELECT {_COLUMNS} FROM blocks WHERE recipient_id = ? ORDER BY block_index',
             (recipient_id,),
         ).fetchall()
         return [LedgerBlock(*row) for row in rows]
@@ -165,7 +200,7 @@ class HashChainLedger:
     def get_all_blocks(self, limit: int = 100, offset: int = 0) -> List[LedgerBlock]:
         """Get blocks with pagination."""
         rows = self.conn.execute(
-            'SELECT * FROM blocks ORDER BY block_index DESC LIMIT ? OFFSET ?',
+            f'SELECT {_COLUMNS} FROM blocks ORDER BY block_index DESC LIMIT ? OFFSET ?',
             (limit, offset),
         ).fetchall()
         return [LedgerBlock(*row) for row in rows]
@@ -178,7 +213,7 @@ class HashChainLedger:
             {"valid": bool, "blocks_checked": int, "errors": [...]}
         """
         rows = self.conn.execute(
-            'SELECT * FROM blocks ORDER BY block_index ASC'
+            f'SELECT {_COLUMNS} FROM blocks ORDER BY block_index ASC'
         ).fetchall()
 
         if not rows:
@@ -200,16 +235,8 @@ class HashChainLedger:
                 })
 
             # Recompute block hash
-            data = json.dumps({
-                "watermark_id": block.watermark_id,
-                "recipient_id": block.recipient_id,
-                "document_hash": block.document_hash,
-                "signature": block.signature,
-                "sig_algorithm": block.sig_algorithm,
-            }, sort_keys=True)
-
             expected_hash = _compute_hash(
-                block.block_index, block.timestamp, data, block.prev_hash
+                block.block_index, block.timestamp, _block_data(block), block.prev_hash
             )
 
             if block.block_hash != expected_hash:

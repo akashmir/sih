@@ -17,19 +17,24 @@ import hashlib
 import io
 import json
 import os
+import re
 import uuid
 from dataclasses import asdict
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from ..crypto import pq_engine, symmetric
-from ..watermark.encoder import generate_watermark, payload_to_bytes
-from ..watermark.embedder import embed_watermark
+from ..watermark.encoder import generate_watermark, recipient_hash
+from ..watermark.embedder import (
+    embed_watermark, output_filename, validate_document, UnsupportedDocumentError,
+)
 from ..watermark.extractor import extract_watermark
 from ..ledger.blockchain import HashChainLedger
 from ..identity.manager import IdentityManager
+from ..documents.store import DocumentStore
 
 router = APIRouter(prefix="/api")
 
@@ -38,16 +43,25 @@ router = APIRouter(prefix="/api")
 # ---------------------------------------------------------------------------
 _ledger: Optional[HashChainLedger] = None
 _identity: Optional[IdentityManager] = None
+_documents: Optional[DocumentStore] = None
 
-# In-memory store for encrypted documents (demo purpose — not production)
-_encrypted_docs: dict = {}
+_USER_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
-def init_services(ledger: HashChainLedger, identity: IdentityManager):
+def init_services(
+    ledger: HashChainLedger, identity: IdentityManager, documents: DocumentStore,
+):
     """Called by main.py to inject shared resources."""
-    global _ledger, _identity
+    global _ledger, _identity, _documents
     _ledger = ledger
     _identity = identity
+    _documents = documents
+
+
+def _content_disposition(filename: str) -> str:
+    """Attachment header safe for any filename (RFC 6266 / 5987)."""
+    ascii_name = re.sub(r'[^A-Za-z0-9._-]', '_', filename) or "download"
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +81,7 @@ async def system_info():
         "crypto": crypto_info,
         "chain_length": chain_length,
         "registered_users": users_count,
-        "documents_encrypted": len(_encrypted_docs),
+        "documents_encrypted": _documents.count() if _documents else 0,
     }
 
 
@@ -83,6 +97,11 @@ async def register_user(
     Register a new user. Returns the private key bundle as a
     downloadable .key file. Server retains ONLY public keys.
     """
+    if not _USER_ID_RE.match(user_id):
+        raise HTTPException(
+            status_code=400,
+            detail="User ID must be 1-64 characters: letters, digits, '_', '.', '-'",
+        )
     try:
         result = _identity.register_user(user_id, display_name)
     except ValueError as e:
@@ -95,7 +114,7 @@ async def register_user(
         io.BytesIO(key_bundle),
         media_type="application/json",
         headers={
-            "Content-Disposition": f"attachment; filename={user_id}_private_keys.key",
+            "Content-Disposition": _content_disposition(f"{user_id}_private_keys.key"),
             "X-User-Id": user.user_id,
             "X-KEM-Algorithm": user.kem_algorithm,
             "X-SIG-Algorithm": user.sig_algorithm,
@@ -138,6 +157,12 @@ async def encrypt_document(
     if not recipient_ids:
         raise HTTPException(status_code=400, detail="No recipients specified")
 
+    # Reject anything we can't watermark now, not at decryption time
+    try:
+        validate_document(doc_data, filename)
+    except UnsupportedDocumentError as e:
+        raise HTTPException(status_code=415, detail=str(e))
+
     # Generate a single AES-256 key for the document
     doc_key = os.urandom(32)
     doc_hash = hashlib.sha256(doc_data).hexdigest()
@@ -162,16 +187,15 @@ async def encrypt_document(
             "encrypted_doc_key_nonce": base64.b64encode(encrypted_key.nonce).decode(),
         }
 
-    # Store encrypted doc in memory (demo)
     doc_id = uuid.uuid4().hex[:12]
-    _encrypted_docs[doc_id] = {
+    _documents.put(doc_id, {
         "filename": filename,
         "doc_hash": doc_hash,
         "encrypted_nonce": base64.b64encode(encrypted.nonce).decode(),
         "encrypted_data": base64.b64encode(encrypted.ciphertext).decode(),
         "encrypted_aad": base64.b64encode(encrypted.aad).decode(),
         "recipients": encapsulated_keys,
-    }
+    })
 
     return {
         "doc_id": doc_id,
@@ -206,10 +230,9 @@ async def decrypt_document(
     9. Return watermarked document
     """
     # Verify document exists
-    if doc_id not in _encrypted_docs:
+    doc_info = _documents.get(doc_id)
+    if doc_info is None:
         raise HTTPException(status_code=404, detail="Document not found")
-
-    doc_info = _encrypted_docs[doc_id]
 
     # Verify recipient is authorized
     if user_id not in doc_info["recipients"]:
@@ -231,10 +254,23 @@ async def decrypt_document(
             detail="Key file does not match the specified user",
         )
 
+    engine_kem = pq_engine.get_crypto_info()["kem_algorithm"]
+    if key_bundle["kem_algorithm"] and key_bundle["kem_algorithm"] != engine_kem:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Key file was generated for {key_bundle['kem_algorithm']}, "
+                f"but the server is running {engine_kem}"
+            ),
+        )
+
     # Decapsulate the shared secret using recipient's ML-KEM private key
     encap_data = doc_info["recipients"][user_id]
     ciphertext = base64.b64decode(encap_data["ciphertext"])
-    shared_secret = pq_engine.decapsulate(key_bundle["kem_private_key"], ciphertext)
+    try:
+        shared_secret = pq_engine.decapsulate(key_bundle["kem_private_key"], ciphertext)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Key decapsulation failed")
 
     # Decrypt the document key using the shared secret
     encrypted_key_payload = symmetric.EncryptedPayload(
@@ -285,6 +321,8 @@ async def decrypt_document(
         document_hash=doc_info["doc_hash"],
         signature=base64.b64encode(sig_result.signature).decode(),
         sig_algorithm=sig_result.algorithm,
+        doc_id=doc_id,
+        watermark_timestamp=wm_payload.timestamp,
     )
 
     # Return the watermarked document
@@ -292,7 +330,9 @@ async def decrypt_document(
         io.BytesIO(watermarked_doc),
         media_type="application/octet-stream",
         headers={
-            "Content-Disposition": f"attachment; filename=decrypted_{filename}",
+            "Content-Disposition": _content_disposition(
+                f"decrypted_{output_filename(filename)}"
+            ),
             "X-Watermark-Id": wm_payload.watermark_id,
             "X-Block-Index": str(block.block_index),
             "X-Block-Hash": block.block_hash,
@@ -340,14 +380,24 @@ async def investigate_document(
     user = _identity.get_user(block.recipient_id)
     sig_public_key = _identity.get_sig_public_key(block.recipient_id)
 
+    # Cross-check the watermark against the ledger record. Blocks written
+    # before doc_id was recorded fall back to the watermark's own values.
+    signed_doc_id = block.doc_id or extracted.doc_id
+    signed_timestamp = block.watermark_timestamp if block.doc_id else extracted.timestamp
+    watermark_consistent = (
+        extracted.recipient_hash == recipient_hash(block.recipient_id)
+        and extracted.doc_id == signed_doc_id
+        and extracted.timestamp == signed_timestamp
+    )
+
     signature_valid = False
     if sig_public_key:
         record_data = json.dumps({
-            "doc_id": extracted.doc_id,
+            "doc_id": signed_doc_id,
             "doc_hash": block.document_hash,
             "watermark_id": block.watermark_id,
             "recipient_id": block.recipient_id,
-            "timestamp": extracted.timestamp,
+            "timestamp": signed_timestamp,
         }, sort_keys=True).encode()
 
         try:
@@ -371,6 +421,8 @@ async def investigate_document(
             "document_hash": block.document_hash,
             "signature_algorithm": block.sig_algorithm,
             "signature_verified": signature_valid,
+            "watermark_consistent": watermark_consistent,
+            "doc_id": signed_doc_id,
         },
         "ledger_proof": {
             "block_index": block.block_index,
@@ -383,6 +435,8 @@ async def investigate_document(
             f"'{user.display_name if user else block.recipient_id}' "
             f"at timestamp {block.timestamp}. "
             f"Digital signature {'VERIFIED ✓' if signature_valid else 'UNVERIFIED ✗'}."
+            + ("" if watermark_consistent else
+               " WARNING: watermark contents do not match the ledger record.")
         ),
     }
 
@@ -417,5 +471,5 @@ async def list_documents():
             "doc_hash": info["doc_hash"],
             "recipients": list(info["recipients"].keys()),
         }
-        for doc_id, info in _encrypted_docs.items()
+        for doc_id, info in _documents.list()
     ]

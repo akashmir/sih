@@ -6,6 +6,7 @@ redundant binary bitstring, and decodes it back with majority-vote error correct
 """
 
 import hashlib
+import re
 import struct
 import uuid
 import time
@@ -30,14 +31,34 @@ ZW_ZERO = '\u200b'      # Zero-Width Space = 0
 ZW_ONE = '\u200c'       # Zero-Width Non-Joiner = 1
 ZW_DELIM = '\ufeff'     # BOM = delimiter (start/end marker)
 
+_ZW_BLOCK = re.compile(f"{ZW_DELIM}([{ZW_ZERO}{ZW_ONE}]+){ZW_DELIM}")
+
+
+def recipient_hash(recipient_id: str) -> str:
+    """Truncated SHA-256 of a recipient ID, as carried in the watermark."""
+    return hashlib.sha256(recipient_id.encode()).hexdigest()[:32]
+
+
+def _compute_checksum(wm_id: str, r_hash: str, ts: int, doc_id: str) -> str:
+    raw = f"{wm_id}:{r_hash}:{ts}:{doc_id}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:8]
+
+
+def is_valid_payload(payload: WatermarkPayload) -> bool:
+    """Check the payload's embedded checksum against its fields."""
+    expected = _compute_checksum(
+        payload.watermark_id, payload.recipient_hash,
+        payload.timestamp, payload.doc_id,
+    )
+    return payload.checksum == expected
+
 
 def generate_watermark(recipient_id: str, doc_id: str = "") -> WatermarkPayload:
     """Generate a unique watermark payload for a decryption session."""
     wm_id = uuid.uuid4().hex
     ts = int(time.time())
-    r_hash = hashlib.sha256(recipient_id.encode()).hexdigest()[:32]
-    raw = f"{wm_id}:{r_hash}:{ts}:{doc_id}"
-    checksum = hashlib.sha256(raw.encode()).hexdigest()[:8]
+    r_hash = recipient_hash(recipient_id)
+    checksum = _compute_checksum(wm_id, r_hash, ts, doc_id)
     return WatermarkPayload(
         watermark_id=wm_id,
         recipient_hash=r_hash,
@@ -123,37 +144,21 @@ def decode_from_text(text: str) -> Optional[WatermarkPayload]:
     """
     Extract and decode watermark from text containing zero-width characters.
     Returns None if no valid watermark found.
+
+    Every delimited run of ZW bits is tried, so a leading BOM in the
+    source file (or a second, damaged watermark) can't mask a valid one.
     """
-    # Find delimited region
-    start = text.find(ZW_DELIM)
-    if start == -1:
-        return None
-    end = text.find(ZW_DELIM, start + 1)
-    if end == -1:
-        return None
-
-    zw_region = text[start+1:end]
-
-    # Convert ZW chars back to bits
-    bits = []
-    for ch in zw_region:
-        if ch == ZW_ZERO:
-            bits.append('0')
-        elif ch == ZW_ONE:
-            bits.append('1')
-        # Skip any other characters
-
-    if not bits:
-        return None
-
-    redundant_bits = ''.join(bits)
-    decoded_bits = decode_redundancy(redundant_bits, 3)
-    raw_bytes = bits_to_bytes(decoded_bits)
-
-    try:
-        return bytes_to_payload(raw_bytes[:50])
-    except (ValueError, struct.error):
-        return None
+    for match in _ZW_BLOCK.finditer(text):
+        redundant_bits = match.group(1).replace(ZW_ZERO, '0').replace(ZW_ONE, '1')
+        decoded_bits = decode_redundancy(redundant_bits, 3)
+        raw_bytes = bits_to_bytes(decoded_bits)
+        try:
+            payload = bytes_to_payload(raw_bytes[:50])
+        except (ValueError, struct.error):
+            continue
+        if is_valid_payload(payload):
+            return payload
+    return None
 
 
 def encode_for_image(payload: WatermarkPayload) -> bytes:
@@ -194,6 +199,7 @@ def decode_from_image(redundant_bits_str: str) -> Optional[WatermarkPayload]:
     raw_bytes = bits_to_bytes(payload_bits)
 
     try:
-        return bytes_to_payload(raw_bytes[:50])
+        payload = bytes_to_payload(raw_bytes[:50])
     except (ValueError, struct.error):
         return None
+    return payload if is_valid_payload(payload) else None

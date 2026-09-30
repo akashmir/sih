@@ -155,7 +155,8 @@ def test_format_detection():
     assert detect_format("doc.png") == "image"
     assert detect_format("doc.jpg") == "image"
     assert detect_format("doc.jpeg") == "image"
-    assert detect_format("unknown.xyz") == "text"  # default
+    assert detect_format("unknown.xyz") is None
+    assert detect_format("report.docx") is None
 
 
 def test_embed_watermark_dispatch():
@@ -172,3 +173,114 @@ def test_embed_watermark_dispatch():
     img.save(buf, format='PNG')
     img_result = embed_watermark(buf.getvalue(), "test.png", wm)
     assert img_result != buf.getvalue()
+
+
+def test_embed_rejects_unsupported_format():
+    """Binary formats are rejected instead of being corrupted as text."""
+    from backend.watermark.embedder import UnsupportedDocumentError
+    wm = generate_watermark("user6", "0123456789ab")
+    with pytest.raises(UnsupportedDocumentError):
+        embed_watermark(bytes(range(256)), "report.docx", wm)
+
+
+def test_validate_document():
+    """validate_document accepts supported docs and rejects the rest."""
+    from backend.watermark.embedder import validate_document, UnsupportedDocumentError
+    validate_document("Plain UTF-8 text".encode(), "a.txt")
+    with pytest.raises(UnsupportedDocumentError):
+        validate_document(b"\xff\xfe\x00bad", "a.txt")      # not UTF-8
+    with pytest.raises(UnsupportedDocumentError):
+        validate_document(b"not an image", "a.png")
+    tiny = io.BytesIO()
+    Image.new('RGB', (10, 10)).save(tiny, format='PNG')
+    with pytest.raises(UnsupportedDocumentError):
+        validate_document(tiny.getvalue(), "a.png")          # too small
+    with pytest.raises(UnsupportedDocumentError):
+        validate_document(b"PK\x03\x04", "a.docx")
+
+
+def test_tampered_checksum_rejected():
+    """A watermark whose checksum doesn't match its fields is ignored."""
+    import dataclasses
+    wm = generate_watermark("user7", "0123456789ab")
+    forged = dataclasses.replace(wm, recipient_hash="0" * 32)
+    assert decode_from_text("x" + encode_for_text(forged) + "y") is None
+
+
+def test_text_with_leading_bom():
+    """A BOM at the start of a UTF-8 file doesn't hide the watermark."""
+    wm = generate_watermark("user8", "0123456789ab")
+    content = "\ufeffFirst line\nSecond line".encode('utf-8')
+    result = extract_from_text(embed_in_text(content, wm))
+    assert result is not None
+    assert result.watermark_id == wm.watermark_id
+
+
+def _sample_pdf(pages=2):
+    import fitz
+    doc = fitz.open()
+    for i in range(pages):
+        doc.new_page().insert_text((72, 72), f"Classified page {i + 1}")
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+def test_pdf_survives_metadata_and_annotation_stripping():
+    """The invisible text layer still carries the watermark."""
+    import fitz
+    wm = generate_watermark("user9", "0123456789ab")
+    doc = fitz.open(stream=embed_watermark(_sample_pdf(), "a.pdf", wm), filetype="pdf")
+    for page in doc:
+        while page.first_annot:
+            page.delete_annot(page.first_annot)
+    doc.set_metadata({})
+    stripped = doc.tobytes()
+    doc.close()
+
+    result = extract_watermark(stripped, "a.pdf")
+    assert result is not None
+    assert result.watermark_id == wm.watermark_id
+
+
+def test_pdf_watermark_on_every_page():
+    """A single page extracted from the PDF still carries the watermark."""
+    import fitz
+    wm = generate_watermark("user10", "0123456789ab")
+    src = fitz.open(stream=embed_watermark(_sample_pdf(3), "a.pdf", wm), filetype="pdf")
+    single = fitz.open()
+    single.insert_pdf(src, from_page=2, to_page=2)
+    data = single.tobytes()
+    result = extract_watermark(data, "page3.pdf")
+    assert result is not None
+    assert result.watermark_id == wm.watermark_id
+
+
+def test_pdf_text_layer_is_invisible():
+    """Watermarked PDF renders identically to the original."""
+    import fitz
+    wm = generate_watermark("user11", "0123456789ab")
+    original = _sample_pdf(1)
+    marked = embed_watermark(original, "a.pdf", wm)
+    render = lambda d: fitz.open(stream=d, filetype="pdf")[0].get_pixmap(annots=False).samples
+    assert render(original) == render(marked)
+
+
+def test_extract_sniffs_renamed_file():
+    """A watermarked image renamed to .txt is still recognised as an image."""
+    wm = generate_watermark("user12", "0123456789ab")
+    img = Image.new('RGB', (50, 30), color=(10, 20, 30))
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    marked = embed_watermark(buf.getvalue(), "photo.png", wm)
+    result = extract_watermark(marked, "innocent.txt")
+    assert result is not None
+    assert result.watermark_id == wm.watermark_id
+
+
+def test_image_output_filename_is_png():
+    """JPEG inputs are delivered with a .png name matching their content."""
+    from backend.watermark.embedder import output_filename
+    assert output_filename("photo.jpg") == "photo.png"
+    assert output_filename("scan.JPEG") == "scan.png"
+    assert output_filename("memo.txt") == "memo.txt"

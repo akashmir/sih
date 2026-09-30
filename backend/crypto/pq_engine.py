@@ -23,13 +23,10 @@ _USE_PQ = False
 try:
     import oqs  # type: ignore
     _USE_PQ = True
-except ImportError:
-    try:
-        from pqcrypto.kem import kyber768  # type: ignore
-        from pqcrypto.sign import dilithium2  # type: ignore
-        _USE_PQ = True
-    except ImportError:
-        pass
+except (ImportError, RuntimeError, OSError):
+    # ImportError: liboqs-python not installed.
+    # RuntimeError/OSError: wrapper installed but the native liboqs is missing.
+    pass
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey, X25519PublicKey,
@@ -76,11 +73,26 @@ class SignatureResult:
 # ---------------------------------------------------------------------------
 # Post-Quantum Engine (oqs)
 # ---------------------------------------------------------------------------
+def _pick_mechanism(enabled: list, preferred: str, legacy: str) -> str:
+    """Prefer the FIPS 203/204 name; fall back to the pre-standard name on old liboqs."""
+    if preferred in enabled:
+        return preferred
+    if legacy in enabled:
+        return legacy
+    raise RuntimeError(f"liboqs supports neither {preferred} nor {legacy}")
+
+
 class _OQSEngine:
     """Engine using liboqs for real PQ crypto."""
 
-    KEM_ALG = "Kyber768"
-    SIG_ALG = "Dilithium3"
+    KEM_ALG = (
+        _pick_mechanism(oqs.get_enabled_kem_mechanisms(), "ML-KEM-768", "Kyber768")
+        if _USE_PQ else ""
+    )
+    SIG_ALG = (
+        _pick_mechanism(oqs.get_enabled_sig_mechanisms(), "ML-DSA-65", "Dilithium3")
+        if _USE_PQ else ""
+    )
 
     @staticmethod
     def generate_kem_keypair() -> KEMKeyPair:
@@ -275,4 +287,6 @@ def import_key_bundle(data: bytes) -> dict:
         "user_id": bundle["user_id"],
         "kem_private_key": base64.b64decode(bundle["kem_private_key"]),
         "sig_private_key": base64.b64decode(bundle["sig_private_key"]),
+        "kem_algorithm": bundle.get("kem_algorithm", ""),
+        "sig_algorithm": bundle.get("sig_algorithm", ""),
     }

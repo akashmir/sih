@@ -207,3 +207,69 @@ def test_genesis_block_prev_hash(ledger):
         sig_algorithm="ML-DSA-65",
     )
     assert block.prev_hash == "0" * 64
+
+
+def test_doc_id_and_timestamp_are_hashed(ledger):
+    """doc_id/watermark_timestamp are stored and tamper-evident."""
+    block = ledger.add_block(
+        watermark_id="wm-doc",
+        recipient_id="user1",
+        document_hash="hash",
+        signature="sig",
+        sig_algorithm="ML-DSA-65",
+        doc_id="0123456789ab",
+        watermark_timestamp=1700000000,
+    )
+    stored = ledger.find_by_watermark("wm-doc")
+    assert stored.doc_id == "0123456789ab"
+    assert stored.watermark_timestamp == 1700000000
+    assert ledger.validate_chain()["valid"] is True
+
+    ledger.conn.execute(
+        "UPDATE blocks SET doc_id = 'ffffffffffff' WHERE block_index = ?",
+        (block.block_index,),
+    )
+    ledger.conn.commit()
+    assert ledger.validate_chain()["valid"] is False
+
+
+def test_migrates_legacy_ledger():
+    """A ledger created before doc_id existed is upgraded and still validates."""
+    import sqlite3
+    from backend.ledger.blockchain import _compute_hash
+    import json
+
+    with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+        db_path = f.name
+    conn = sqlite3.connect(db_path)
+    conn.execute('''
+        CREATE TABLE blocks (
+            block_index INTEGER PRIMARY KEY, timestamp REAL NOT NULL,
+            watermark_id TEXT NOT NULL, recipient_id TEXT NOT NULL,
+            document_hash TEXT NOT NULL, signature TEXT NOT NULL,
+            sig_algorithm TEXT NOT NULL, prev_hash TEXT NOT NULL,
+            block_hash TEXT NOT NULL UNIQUE
+        )
+    ''')
+    data = json.dumps({
+        "watermark_id": "wm-old", "recipient_id": "u", "document_hash": "h",
+        "signature": "s", "sig_algorithm": "a",
+    }, sort_keys=True)
+    ts = 1700000000.5
+    conn.execute(
+        "INSERT INTO blocks VALUES (0, ?, 'wm-old', 'u', 'h', 's', 'a', ?, ?)",
+        (ts, "0" * 64, _compute_hash(0, ts, data, "0" * 64)),
+    )
+    conn.commit()
+    conn.close()
+
+    led = HashChainLedger(db_path)
+    try:
+        assert led.validate_chain()["valid"] is True
+        assert led.find_by_watermark("wm-old").doc_id == ""
+        led.add_block("wm-new", "u", "h", "s", "a", doc_id="abcdef012345",
+                      watermark_timestamp=1)
+        assert led.validate_chain() == {"valid": True, "blocks_checked": 2, "errors": []}
+    finally:
+        led.close()
+        os.unlink(db_path)
