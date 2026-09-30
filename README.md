@@ -14,7 +14,7 @@ NISHAN is a cryptographic attribution and immutable decryption provenance system
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│              React Frontend (Vite)                  │
+│     React Frontend (Vite) — browser or Electron     │
 │  Dashboard │ Register │ Distribute │ Decrypt        │
 │  Investigate │ Ledger Explorer                      │
 └──────────────────┬──────────────────────────────────┘
@@ -59,6 +59,7 @@ Configuration (environment variables):
 |----------|---------|---------|
 | `NISHAN_DATA_DIR` | `backend/data` | Where the SQLite databases live |
 | `NISHAN_CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Allowed browser origins |
+| `NISHAN_FRONTEND_DIST` | *(unset)* | Serve this built UI directory at `/` (set by the desktop app) |
 
 ### Tests
 ```bash
@@ -66,7 +67,23 @@ python -m pytest backend/tests
 ```
 Tests use throwaway databases and never touch `backend/data`.
 
-### Frontend
+### Desktop app (Electron)
+```bash
+pip install -r backend/requirements.txt
+cd frontend_app
+npm install
+npm run desktop
+```
+
+`npm run desktop` builds the UI and opens NISHAN in a native window. The app starts the
+Python backend itself on a free localhost port, serves the built UI from it, and stops it
+on exit — no separate server or browser needed. Set `NISHAN_PYTHON` to pick a specific
+Python executable. Data lives in `backend/data` (or `NISHAN_DATA_DIR`).
+
+For UI development with hot reload, run the backend on port 8000 and `npm run dev`, then
+`npm run desktop:dev` to load the Vite dev server in the desktop window.
+
+### Web frontend (development)
 ```bash
 cd frontend_app
 npm install
@@ -93,7 +110,7 @@ Open http://localhost:5173
 | Watermark | Zero-width chars (text), LSB steganography (images), PDF metadata + annotation + invisible text layer |
 | Ledger | SHA-256 hash chain, SQLite |
 | Storage | Encrypted documents persisted in SQLite |
-| Frontend | React + Vite |
+| Frontend | React + Vite, packaged as an Electron desktop app |
 
 ## Supported Formats
 - UTF-8 text (`.txt`, `.md`, `.csv`, `.json`, `.xml`, `.html`, `.log`)

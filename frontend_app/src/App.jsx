@@ -1,16 +1,26 @@
 import { useState, useEffect, useCallback } from 'react'
 import './index.css'
 
-const API = ''  // Vite proxy handles /api
+const API = ''  // Same origin: Vite proxy in dev, the backend itself in the desktop app
 
 // ─── API helpers ────────────────────────────────────────────────────
 async function api(path, opts = {}) {
   const res = await fetch(`${API}${path}`, opts)
-  if (!res.ok && !opts.raw) {
+  if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
     throw new Error(err.detail || 'Request failed')
   }
-  return opts.raw ? res : res.json()
+  return res.json()
+}
+
+// POST a form and return the raw response, throwing the server's error detail
+async function postForm(path, form) {
+  const res = await fetch(`${API}${path}`, { method: 'POST', body: form })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }))
+    throw new Error(err.detail || 'Request failed')
+  }
+  return res
 }
 
 // Filename from a Content-Disposition header, preferring the RFC 5987 form
@@ -24,78 +34,152 @@ function dispositionFilename(header, fallback) {
   return plain ? plain[1] : fallback
 }
 
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+const shortAlg = alg => alg?.replace(/\s*\(classical fallback\)/, '') ?? '…'
+const shortHash = (h, n = 16) => (h ? `${h.substring(0, n)}…` : '—')
+const formatTime = ts => new Date(ts * 1000).toLocaleString('en-IN')
+
+const SUPPORTED = '.txt .md .csv .json .xml .html .log .pdf .png .jpg .bmp'
+
+// ─── Shared UI ──────────────────────────────────────────────────────
+function PageHeader({ title, subtitle, children }) {
+  return (
+    <div className="page-header">
+      <div>
+        <h2>{title}</h2>
+        <p>{subtitle}</p>
+      </div>
+      {children && <div className="page-actions">{children}</div>}
+    </div>
+  )
+}
+
+function Row({ label, children, mono = true }) {
+  return (
+    <div className="result-row">
+      <span className="label">{label}</span>
+      <span className={mono ? 'value' : 'value plain'}>{children}</span>
+    </div>
+  )
+}
+
+function Status({ status }) {
+  if (!status) return null
+  const cls = { success: 'success', error: 'danger', loading: '', warning: 'warning' }[status.type]
+  const icon = { success: '✅', error: '❌', loading: '⏳', warning: '⚠️' }[status.type]
+  return (
+    <div className={`result-box ${cls}`} role={status.type === 'error' ? 'alert' : 'status'}>
+      <h4>{icon} {status.msg}</h4>
+      {status.children}
+    </div>
+  )
+}
+
+function FilePicker({ file, onChange, icon, prompt, hint, accept }) {
+  return (
+    <label className={`file-input-wrapper ${file ? 'has-file' : ''}`}>
+      <input type="file" accept={accept} onChange={e => onChange(e.target.files[0] || null)} />
+      <div className="icon">{file ? '📄' : icon}</div>
+      <div className="label">{file ? file.name : prompt}</div>
+      {hint && <div className="sublabel">{hint}</div>}
+    </label>
+  )
+}
+
 // ─── Dashboard ──────────────────────────────────────────────────────
 function Dashboard() {
   const [info, setInfo] = useState(null)
   const [chain, setChain] = useState(null)
+  const [error, setError] = useState(null)
 
   useEffect(() => {
-    api('/api/system/info').then(setInfo).catch(() => {})
+    api('/api/system/info').then(setInfo).catch(e => setError(e.message))
     api('/api/ledger/verify').then(setChain).catch(() => {})
   }, [])
 
+  const pq = info?.crypto?.post_quantum
+
   return (
     <div className="animate-in">
-      <div className="page-header">
-        <h2>Dashboard</h2>
-        <p>System overview and health status for NISHAN</p>
-      </div>
+      <PageHeader title="Dashboard" subtitle="System overview and health status" />
+
+      {error && (
+        <div className="alert alert-danger" role="alert">
+          <span>⚠️</span>
+          <span>Cannot reach the NISHAN backend ({error}). Make sure it is running.</span>
+        </div>
+      )}
 
       <div className="stats-grid">
         <div className="stat-card">
           <div className="stat-icon">🔐</div>
-          <div className="stat-value">{info?.crypto?.kem_algorithm || '...'}</div>
+          <div className="stat-value small">{shortAlg(info?.crypto?.kem_algorithm)}</div>
           <div className="stat-label">Key Encapsulation</div>
         </div>
         <div className="stat-card">
           <div className="stat-icon">✍️</div>
-          <div className="stat-value">{info?.crypto?.sig_algorithm || '...'}</div>
+          <div className="stat-value small">{shortAlg(info?.crypto?.sig_algorithm)}</div>
           <div className="stat-label">Digital Signatures</div>
         </div>
         <div className="stat-card">
+          <div className="stat-icon">{chain ? (chain.valid ? '✅' : '❌') : '⛓️'}</div>
+          <div className={`stat-value ${chain && !chain.valid ? 'bad' : ''}`}>
+            {chain ? (chain.valid ? 'Valid' : 'Tampered') : '…'}
+          </div>
+          <div className="stat-label">Chain Integrity</div>
+        </div>
+        <div className="stat-card">
           <div className="stat-icon">👥</div>
-          <div className="stat-value">{info?.registered_users ?? '...'}</div>
+          <div className="stat-value">{info?.registered_users ?? '…'}</div>
           <div className="stat-label">Registered Users</div>
         </div>
         <div className="stat-card">
           <div className="stat-icon">📄</div>
-          <div className="stat-value">{info?.documents_encrypted ?? '...'}</div>
+          <div className="stat-value">{info?.documents_encrypted ?? '…'}</div>
           <div className="stat-label">Documents Encrypted</div>
         </div>
         <div className="stat-card">
-          <div className="stat-icon">⛓️</div>
-          <div className="stat-value">{info?.chain_length ?? '...'}</div>
-          <div className="stat-label">Chain Length</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-icon">{chain?.valid ? '✅' : '❌'}</div>
-          <div className="stat-value">{chain ? (chain.valid ? 'Valid' : 'Tampered') : '...'}</div>
-          <div className="stat-label">Chain Integrity</div>
+          <div className="stat-icon">📦</div>
+          <div className="stat-value">{info?.chain_length ?? '…'}</div>
+          <div className="stat-label">Ledger Blocks</div>
         </div>
       </div>
 
       <div className="grid-2">
         <div className="card">
-          <div className="card-header"><span className="card-title">System Info</span></div>
-          {info && Object.entries(info).filter(([k]) => k !== 'crypto').map(([k, v]) => (
-            <div className="result-row" key={k}>
-              <span className="label">{k}</span>
-              <span className="value">{String(v)}</span>
+          <div className="card-header"><span className="card-title">Cryptographic Backend</span></div>
+          {info && (
+            <div className={`alert ${pq ? 'alert-success' : 'alert-warning'}`}>
+              <span>{pq ? '🛡️' : 'ℹ️'}</span>
+              <span>
+                {pq
+                  ? 'Post-quantum algorithms active (NIST FIPS 203 / 204).'
+                  : 'Classical fallback active (X25519 / Ed25519) — not quantum-safe. Install liboqs-python to enable ML-KEM / ML-DSA.'}
+              </span>
             </div>
+          )}
+          {info?.crypto && Object.entries(info.crypto).map(([k, v]) => (
+            <Row key={k} label={k.replace(/_/g, ' ')}>{String(v)}</Row>
           ))}
         </div>
         <div className="card">
-          <div className="card-header"><span className="card-title">Cryptographic Backend</span></div>
-          <div className="alert alert-info">
-            <span>ℹ️</span>
-            <span>{info?.crypto?.post_quantum ? 'Post-quantum algorithms active (NIST-standardized)' : 'Classical fallback active — install liboqs for PQ'}</span>
-          </div>
-          {info?.crypto && Object.entries(info.crypto).map(([k, v]) => (
-            <div className="result-row" key={k}>
-              <span className="label">{k}</span>
-              <span className="value">{String(v)}</span>
-            </div>
-          ))}
+          <div className="card-header"><span className="card-title">System</span></div>
+          {info && (
+            <>
+              <Row label="Project">{info.project}</Row>
+              <Row label="Version">{info.version}</Row>
+              <Row label="Organization" mono={false}>{info.organization}</Row>
+              <Row label="Chain checked">{chain ? `${chain.blocks_checked} blocks` : '…'}</Row>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -115,70 +199,79 @@ function Register() {
 
   useEffect(() => { loadUsers() }, [loadUsers])
 
-  const register = async () => {
+  const validId = /^[A-Za-z0-9_.-]{1,64}$/.test(userId)
+
+  const register = async e => {
+    e.preventDefault()
     try {
-      setStatus({ type: 'loading', msg: 'Generating keypairs...' })
+      setStatus({ type: 'loading', msg: 'Generating keypairs…' })
       const form = new FormData()
       form.append('user_id', userId)
       form.append('display_name', name)
-      const res = await fetch('/api/users/register', { method: 'POST', body: form })
-      if (!res.ok) {
-        const err = await res.json()
-        throw new Error(err.detail)
-      }
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `${userId}_private_keys.key`
-      a.click()
-      URL.revokeObjectURL(url)
-      setStatus({ type: 'success', msg: `Registered! Private key downloaded as ${userId}_private_keys.key` })
+      const res = await postForm('/api/users/register', form)
+      const filename = dispositionFilename(res.headers.get('Content-Disposition'), `${userId}_private_keys.key`)
+      downloadBlob(await res.blob(), filename)
+      setStatus({
+        type: 'success',
+        msg: `Registered ${name}`,
+        children: (
+          <p className="hint">
+            Private key saved as <strong>{filename}</strong>. This is the only copy — store it securely;
+            it is needed to decrypt documents.
+          </p>
+        ),
+      })
       setUserId('')
       setName('')
       loadUsers()
-    } catch (e) {
-      setStatus({ type: 'error', msg: e.message })
+    } catch (err) {
+      setStatus({ type: 'error', msg: err.message })
     }
   }
 
   return (
     <div className="animate-in">
-      <div className="page-header">
-        <h2>Register Recipients</h2>
-        <p>Generate post-quantum keypairs. Private keys are downloaded — server retains only public keys.</p>
-      </div>
+      <PageHeader
+        title="Register Recipients"
+        subtitle="Generate recipient keypairs. The private key is saved to your computer; the server keeps only public keys."
+      />
 
       <div className="grid-2">
-        <div className="card">
-          <div className="card-header"><span className="card-title">New User</span></div>
+        <form className="card" onSubmit={register}>
+          <div className="card-header"><span className="card-title">New Recipient</span></div>
           <div className="form-group">
-            <label>User ID</label>
-            <input className="form-input" placeholder="e.g. admiral_kumar" value={userId} onChange={e => setUserId(e.target.value)} />
+            <label htmlFor="reg-id">User ID</label>
+            <input id="reg-id" className="form-input" placeholder="e.g. admiral_kumar" value={userId}
+              onChange={e => setUserId(e.target.value)} aria-invalid={userId !== '' && !validId} />
+            <div className={`field-hint ${userId && !validId ? 'error' : ''}`}>
+              Letters, digits, <code>_</code> <code>.</code> <code>-</code> — up to 64 characters
+            </div>
           </div>
           <div className="form-group">
-            <label>Display Name</label>
-            <input className="form-input" placeholder="e.g. Admiral R. Kumar" value={name} onChange={e => setName(e.target.value)} />
+            <label htmlFor="reg-name">Display Name</label>
+            <input id="reg-name" className="form-input" placeholder="e.g. Admiral R. Kumar" value={name}
+              onChange={e => setName(e.target.value)} />
           </div>
-          <button className="btn btn-primary" onClick={register} disabled={!userId || !name}>
+          <button type="submit" className="btn btn-primary"
+            disabled={!validId || !name.trim() || status?.type === 'loading'}>
             🔑 Generate Keys & Register
           </button>
-          {status && (
-            <div className={`result-box ${status.type === 'success' ? 'success' : status.type === 'error' ? 'danger' : ''}`} style={{ marginTop: 16 }}>
-              <h4>{status.type === 'loading' ? '⏳' : status.type === 'success' ? '✅' : '❌'} {status.msg}</h4>
-            </div>
-          )}
-        </div>
+          <Status status={status} />
+        </form>
         <div className="card">
-          <div className="card-header"><span className="card-title">Registered Users ({users.length})</span></div>
+          <div className="card-header">
+            <span className="card-title">Registered Recipients</span>
+            <span className="count">{users.length}</span>
+          </div>
           {users.length === 0 ? (
             <div className="empty-state"><div className="icon">👤</div><p>No users registered yet</p></div>
-          ) : users.map(u => (
-            <div className="result-row" key={u.user_id}>
-              <span className="label">{u.display_name}</span>
-              <span className="value">{u.user_id}</span>
+          ) : (
+            <div className="scroll-list">
+              {users.map(u => (
+                <Row key={u.user_id} label={u.display_name}>{u.user_id}</Row>
+              ))}
             </div>
-          ))}
+          )}
         </div>
       </div>
     </div>
@@ -190,77 +283,81 @@ function Distribute() {
   const [file, setFile] = useState(null)
   const [users, setUsers] = useState([])
   const [selected, setSelected] = useState([])
-  const [result, setResult] = useState(null)
-  const [loading, setLoading] = useState(false)
+  const [status, setStatus] = useState(null)
 
   useEffect(() => { api('/api/users').then(setUsers).catch(() => {}) }, [])
 
   const toggle = id => setSelected(s => s.includes(id) ? s.filter(x => x !== id) : [...s, id])
+  const allSelected = users.length > 0 && selected.length === users.length
 
   const encrypt = async () => {
-    if (!file || selected.length === 0) return
-    setLoading(true)
+    setStatus({ type: 'loading', msg: 'Encrypting…' })
     try {
       const form = new FormData()
       form.append('document', file)
       form.append('recipients', selected.join(','))
-      const res = await api('/api/documents/encrypt', { method: 'POST', body: form })
-      setResult(res)
+      const res = await (await postForm('/api/documents/encrypt', form)).json()
+      setStatus({
+        type: 'success',
+        msg: res.message,
+        children: (
+          <>
+            <Row label="Document ID">{res.doc_id}</Row>
+            <Row label="Filename">{res.filename}</Row>
+            <Row label="SHA-256">{shortHash(res.doc_hash, 24)}</Row>
+            <Row label="Recipients">{res.recipients.join(', ')}</Row>
+          </>
+        ),
+      })
+      setFile(null)
+      setSelected([])
     } catch (e) {
-      setResult({ error: e.message })
+      setStatus({ type: 'error', msg: e.message })
     }
-    setLoading(false)
   }
 
   return (
     <div className="animate-in">
-      <div className="page-header">
-        <h2>Distribute Document</h2>
-        <p>Encrypt a document and prepare it for multi-recipient distribution</p>
-      </div>
+      <PageHeader title="Distribute Document" subtitle="Encrypt a document once for multiple recipients" />
 
       <div className="card">
         <div className="form-group">
           <label>Document</label>
-          <div className="file-input-wrapper">
-            <input type="file" onChange={e => setFile(e.target.files[0])} />
-            <div className="icon">📁</div>
-            <div className="label">{file ? file.name : 'Click to select a document'}</div>
-            <div className="sublabel">Supported: .txt, .md, .csv, .json, .xml, .html, .log, .pdf, .png, .jpg, .bmp</div>
-          </div>
+          <FilePicker file={file} onChange={setFile} icon="📁"
+            prompt="Click to select a document" hint={`Supported: ${SUPPORTED}`} />
         </div>
 
         <div className="form-group">
-          <label>Select Recipients</label>
+          <div className="label-row">
+            <label>Recipients {selected.length > 0 && <span className="count">{selected.length}</span>}</label>
+            {users.length > 0 && (
+              <button type="button" className="link-btn"
+                onClick={() => setSelected(allSelected ? [] : users.map(u => u.user_id))}>
+                {allSelected ? 'Clear all' : 'Select all'}
+              </button>
+            )}
+          </div>
           {users.length === 0 ? (
             <div className="alert alert-warning"><span>⚠️</span><span>No registered users. Register recipients first.</span></div>
           ) : (
             <div className="chip-list">
               {users.map(u => (
-                <div key={u.user_id} className={`chip ${selected.includes(u.user_id) ? 'selected' : ''}`} onClick={() => toggle(u.user_id)}>
+                <button type="button" key={u.user_id} title={u.user_id}
+                  className={`chip ${selected.includes(u.user_id) ? 'selected' : ''}`}
+                  aria-pressed={selected.includes(u.user_id)} onClick={() => toggle(u.user_id)}>
                   {u.display_name}
-                </div>
+                </button>
               ))}
             </div>
           )}
         </div>
 
-        <button className="btn btn-primary" onClick={encrypt} disabled={!file || selected.length === 0 || loading}>
-          {loading ? '⏳ Encrypting...' : '🔐 Encrypt & Distribute'}
+        <button className="btn btn-primary" onClick={encrypt}
+          disabled={!file || selected.length === 0 || status?.type === 'loading'}>
+          {status?.type === 'loading' ? '⏳ Encrypting…' : '🔐 Encrypt & Distribute'}
         </button>
 
-        {result && !result.error && (
-          <div className="result-box success">
-            <h4>✅ Document encrypted successfully</h4>
-            <div className="result-row"><span className="label">Document ID</span><span className="value">{result.doc_id}</span></div>
-            <div className="result-row"><span className="label">Filename</span><span className="value">{result.filename}</span></div>
-            <div className="result-row"><span className="label">Hash (SHA-256)</span><span className="value">{result.doc_hash?.substring(0, 24)}...</span></div>
-            <div className="result-row"><span className="label">Recipients</span><span className="value">{result.recipients?.join(', ')}</span></div>
-          </div>
-        )}
-        {result?.error && (
-          <div className="result-box danger"><h4>❌ {result.error}</h4></div>
-        )}
+        <Status status={status} />
       </div>
     </div>
   )
@@ -272,97 +369,84 @@ function Decrypt() {
   const [docId, setDocId] = useState('')
   const [userId, setUserId] = useState('')
   const [keyFile, setKeyFile] = useState(null)
-  const [result, setResult] = useState(null)
-  const [loading, setLoading] = useState(false)
+  const [status, setStatus] = useState(null)
 
   useEffect(() => { api('/api/documents').then(setDocs).catch(() => {}) }, [])
 
+  const doc = docs.find(d => d.doc_id === docId)
+
   const decrypt = async () => {
-    setLoading(true)
+    setStatus({ type: 'loading', msg: 'Decrypting & watermarking…' })
     try {
       const form = new FormData()
       form.append('doc_id', docId)
       form.append('user_id', userId)
       form.append('key_file', keyFile)
-      const res = await fetch('/api/documents/decrypt', { method: 'POST', body: form })
-      if (!res.ok) {
-        const err = await res.json()
-        throw new Error(err.detail)
-      }
-      const blob = await res.blob()
-      const wmId = res.headers.get('X-Watermark-Id')
-      const blockHash = res.headers.get('X-Block-Hash')
-      const blockIndex = res.headers.get('X-Block-Index')
-      const signedWith = res.headers.get('X-Signed-With')
-
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = dispositionFilename(res.headers.get('Content-Disposition'), 'decrypted_document')
-      a.click()
-      URL.revokeObjectURL(url)
-
-      setResult({ success: true, wmId, blockHash, blockIndex, signedWith })
+      const res = await postForm('/api/documents/decrypt', form)
+      const filename = dispositionFilename(res.headers.get('Content-Disposition'), 'decrypted_document')
+      downloadBlob(await res.blob(), filename)
+      setStatus({
+        type: 'success',
+        msg: `Saved ${filename}`,
+        children: (
+          <>
+            <Row label="Watermark ID">{res.headers.get('X-Watermark-Id')}</Row>
+            <Row label="Ledger block">#{res.headers.get('X-Block-Index')}</Row>
+            <Row label="Block hash">{shortHash(res.headers.get('X-Block-Hash'), 24)}</Row>
+            <Row label="Signed with">{res.headers.get('X-Signed-With')}</Row>
+          </>
+        ),
+      })
     } catch (e) {
-      setResult({ error: e.message })
+      setStatus({ type: 'error', msg: e.message })
     }
-    setLoading(false)
   }
 
   return (
     <div className="animate-in">
-      <div className="page-header">
-        <h2>Decrypt Document</h2>
-        <p>Decrypt your copy — a unique forensic watermark will be embedded silently</p>
-      </div>
+      <PageHeader title="Decrypt Document"
+        subtitle="Decrypt your copy — a unique, invisible forensic watermark is embedded and the event is logged" />
 
       <div className="alert alert-info">
         <span>🔒</span>
-        <span>Upload your private key file (.key) to decrypt. A unique invisible watermark tied to your identity will be embedded in the decrypted copy.</span>
+        <span>Every decryption is signed with your key and recorded in the audit ledger. Your copy carries a watermark that identifies you.</span>
       </div>
 
       <div className="card">
-        <div className="form-group">
-          <label>Document ID</label>
-          <select className="form-select" value={docId} onChange={e => setDocId(e.target.value)}>
-            <option value="">Select a document...</option>
-            {docs.map(d => (
-              <option key={d.doc_id} value={d.doc_id}>{d.filename} ({d.doc_id})</option>
-            ))}
-          </select>
-        </div>
+        <div className="grid-2 tight">
+          <div className="form-group">
+            <label htmlFor="dec-doc">Document</label>
+            <select id="dec-doc" className="form-select" value={docId}
+              onChange={e => { setDocId(e.target.value); setUserId('') }}>
+              <option value="">Select a document…</option>
+              {docs.map(d => (
+                <option key={d.doc_id} value={d.doc_id}>{d.filename} ({d.doc_id})</option>
+              ))}
+            </select>
+          </div>
 
-        <div className="form-group">
-          <label>Your User ID</label>
-          <input className="form-input" placeholder="e.g. admiral_kumar" value={userId} onChange={e => setUserId(e.target.value)} />
+          <div className="form-group">
+            <label htmlFor="dec-user">Recipient</label>
+            <select id="dec-user" className="form-select" value={userId} disabled={!doc}
+              onChange={e => setUserId(e.target.value)}>
+              <option value="">{doc ? 'Select your user ID…' : 'Select a document first'}</option>
+              {doc?.recipients.map(r => <option key={r} value={r}>{r}</option>)}
+            </select>
+          </div>
         </div>
 
         <div className="form-group">
           <label>Private Key File (.key)</label>
-          <div className="file-input-wrapper">
-            <input type="file" accept=".key" onChange={e => setKeyFile(e.target.files[0])} />
-            <div className="icon">🔑</div>
-            <div className="label">{keyFile ? keyFile.name : 'Upload your .key file'}</div>
-            <div className="sublabel">The private key bundle you downloaded at registration</div>
-          </div>
+          <FilePicker file={keyFile} onChange={setKeyFile} icon="🔑" accept=".key"
+            prompt="Select your .key file" hint="The private key file saved when you registered" />
         </div>
 
-        <button className="btn btn-primary" onClick={decrypt} disabled={!docId || !userId || !keyFile || loading}>
-          {loading ? '⏳ Decrypting & Watermarking...' : '🔓 Decrypt Document'}
+        <button className="btn btn-primary" onClick={decrypt}
+          disabled={!docId || !userId || !keyFile || status?.type === 'loading'}>
+          {status?.type === 'loading' ? '⏳ Decrypting…' : '🔓 Decrypt Document'}
         </button>
 
-        {result?.success && (
-          <div className="result-box success">
-            <h4>✅ Document decrypted & watermarked</h4>
-            <div className="result-row"><span className="label">Watermark ID</span><span className="value">{result.wmId}</span></div>
-            <div className="result-row"><span className="label">Block Index</span><span className="value">#{result.blockIndex}</span></div>
-            <div className="result-row"><span className="label">Block Hash</span><span className="value">{result.blockHash?.substring(0, 24)}...</span></div>
-            <div className="result-row"><span className="label">Signed With</span><span className="value">{result.signedWith}</span></div>
-          </div>
-        )}
-        {result?.error && (
-          <div className="result-box danger"><h4>❌ {result.error}</h4></div>
-        )}
+        <Status status={status} />
       </div>
     </div>
   )
@@ -375,76 +459,84 @@ function Investigate() {
   const [loading, setLoading] = useState(false)
 
   const investigate = async () => {
-    if (!file) return
     setLoading(true)
+    setResult(null)
     try {
       const form = new FormData()
       form.append('document', file)
-      const res = await api('/api/forensics/investigate', { method: 'POST', body: form })
-      setResult(res)
+      setResult(await (await postForm('/api/forensics/investigate', form)).json())
     } catch (e) {
-      setResult({ found: false, message: e.message })
+      setResult({ error: e.message })
     }
     setLoading(false)
   }
 
+  const attr = result?.attribution
+  const proof = result?.ledger_proof
+  const trusted = attr?.signature_verified && attr?.watermark_consistent
+
   return (
     <div className="animate-in">
-      <div className="page-header">
-        <h2>🔍 Forensic Investigation</h2>
-        <p>Upload a leaked document to extract its watermark and identify the responsible recipient</p>
-      </div>
+      <PageHeader title="Forensic Investigation"
+        subtitle="Upload a leaked copy to extract its watermark and identify the responsible recipient" />
 
       <div className="card">
         <div className="form-group">
-          <label>Leaked Document</label>
-          <div className="file-input-wrapper">
-            <input type="file" onChange={e => setFile(e.target.files[0])} />
-            <div className="icon">🕵️</div>
-            <div className="label">{file ? file.name : 'Upload the suspected leaked document'}</div>
-          </div>
+          <label>Suspected Leaked Document</label>
+          <FilePicker file={file} onChange={f => { setFile(f); setResult(null) }} icon="🕵️"
+            prompt="Select the leaked document" />
         </div>
 
         <button className="btn btn-danger" onClick={investigate} disabled={!file || loading}>
-          {loading ? '⏳ Analyzing...' : '🔍 Investigate Document'}
+          {loading ? '⏳ Analyzing…' : '🔍 Investigate Document'}
         </button>
 
-        {result && !result.found && (
-          <div className="result-box warning">
-            <h4>⚠️ {result.message}</h4>
-          </div>
+        {result?.error && <Status status={{ type: 'error', msg: result.error }} />}
+
+        {result && !result.error && !result.ledger_match && (
+          <Status status={{
+            type: 'warning',
+            msg: result.message,
+            children: result.watermark_id && <Row label="Watermark ID">{result.watermark_id}</Row>,
+          }} />
         )}
 
-        {result?.found && result?.ledger_match && (
-          <div className="result-box success">
-            <h4>🎯 Attribution Found</h4>
-            <div className="alert alert-success" style={{ margin: '12px 0' }}>
-              <span>✅</span>
+        {result?.ledger_match && (
+          <div className={`result-box ${trusted ? 'success' : 'danger'}`}>
+            <h4>🎯 Attribution {trusted ? 'Established' : 'Found — Verification Failed'}</h4>
+            <div className={`alert ${trusted ? 'alert-success' : 'alert-danger'}`}>
+              <span>{trusted ? '✅' : '⚠️'}</span>
               <span>{result.message}</span>
             </div>
 
-            <h4 style={{ marginTop: 20 }}>Extracted Watermark</h4>
-            <div className="result-row"><span className="label">Watermark ID</span><span className="value">{result.watermark_id}</span></div>
-
-            <h4 style={{ marginTop: 20 }}>Attribution Details</h4>
-            <div className="result-row"><span className="label">Recipient ID</span><span className="value">{result.attribution.recipient_id}</span></div>
-            <div className="result-row"><span className="label">Recipient Name</span><span className="value">{result.attribution.recipient_name}</span></div>
-            <div className="result-row"><span className="label">Decryption Time</span><span className="value">{new Date(result.attribution.decryption_timestamp * 1000).toLocaleString()}</span></div>
-            <div className="result-row"><span className="label">Document Hash</span><span className="value">{result.attribution.document_hash?.substring(0, 32)}...</span></div>
-            <div className="result-row"><span className="label">Signature Algo</span><span className="value">{result.attribution.signature_algorithm}</span></div>
-            <div className="result-row">
-              <span className="label">Signature Status</span>
-              <span>{result.attribution.signature_verified ? <span className="badge-valid">✓ Verified</span> : <span className="badge-invalid">✗ Unverified</span>}</span>
+            <div className="grid-2 tight">
+              <div>
+                <h5>Recipient</h5>
+                <Row label="Name" mono={false}>{attr.recipient_name}</Row>
+                <Row label="User ID">{attr.recipient_id}</Row>
+                <Row label="Decrypted at" mono={false}>{formatTime(attr.decryption_timestamp)}</Row>
+                <Row label="Document ID">{attr.doc_id}</Row>
+                <Row label="Document hash">{shortHash(attr.document_hash, 24)}</Row>
+              </div>
+              <div>
+                <h5>Evidence</h5>
+                <Row label="Watermark ID">{result.watermark_id}</Row>
+                <Row label="Signature" mono={false}>
+                  {attr.signature_verified
+                    ? <span className="badge-valid">✓ Verified</span>
+                    : <span className="badge-invalid">✗ Unverified</span>}
+                </Row>
+                <Row label="Watermark ↔ Ledger" mono={false}>
+                  {attr.watermark_consistent
+                    ? <span className="badge-valid">✓ Consistent</span>
+                    : <span className="badge-invalid">✗ Mismatch</span>}
+                </Row>
+                <Row label="Algorithm">{attr.signature_algorithm}</Row>
+                <Row label="Ledger block">#{proof.block_index}</Row>
+                <Row label="Block hash">{shortHash(proof.block_hash, 24)}</Row>
+                <Row label="Previous hash">{shortHash(proof.prev_hash, 24)}</Row>
+              </div>
             </div>
-            <div className="result-row">
-              <span className="label">Watermark ↔ Ledger</span>
-              <span>{result.attribution.watermark_consistent ? <span className="badge-valid">✓ Consistent</span> : <span className="badge-invalid">✗ Mismatch</span>}</span>
-            </div>
-
-            <h4 style={{ marginTop: 20 }}>Ledger Proof</h4>
-            <div className="result-row"><span className="label">Block Index</span><span className="value">#{result.ledger_proof.block_index}</span></div>
-            <div className="result-row"><span className="label">Block Hash</span><span className="value">{result.ledger_proof.block_hash?.substring(0, 32)}...</span></div>
-            <div className="result-row"><span className="label">Previous Hash</span><span className="value">{result.ledger_proof.prev_hash?.substring(0, 32)}...</span></div>
           </div>
         )}
       </div>
@@ -457,18 +549,29 @@ function LedgerExplorer() {
   const [blocks, setBlocks] = useState([])
   const [total, setTotal] = useState(0)
   const [validation, setValidation] = useState(null)
+  const [loading, setLoading] = useState(true)
 
-  useEffect(() => {
-    api('/api/ledger/blocks').then(d => { setBlocks(d.blocks); setTotal(d.total) }).catch(() => {})
-    api('/api/ledger/verify').then(setValidation).catch(() => {})
-  }, [])
+  const load = useCallback(() => (
+    Promise.all([api('/api/ledger/blocks'), api('/api/ledger/verify')])
+      .then(([d, v]) => {
+        setBlocks(d.blocks)
+        setTotal(d.total)
+        setValidation(v)
+      })
+      .catch(() => { /* leave previous data */ })
+      .finally(() => setLoading(false))
+  ), [])
+
+  useEffect(() => { load() }, [load])
 
   return (
     <div className="animate-in">
-      <div className="page-header">
-        <h2>⛓️ Audit Ledger Explorer</h2>
-        <p>Browse the tamper-evident hash chain — every decryption event is recorded</p>
-      </div>
+      <PageHeader title="Audit Ledger"
+        subtitle="Tamper-evident hash chain — every decryption event is recorded">
+        <button className="btn btn-secondary" onClick={() => { setLoading(true); load() }} disabled={loading}>
+          {loading ? '⏳' : '↻'} Refresh & Verify
+        </button>
+      </PageHeader>
 
       <div className="stats-grid">
         <div className="stat-card">
@@ -477,8 +580,10 @@ function LedgerExplorer() {
           <div className="stat-label">Total Blocks</div>
         </div>
         <div className="stat-card">
-          <div className="stat-icon">{validation?.valid ? '✅' : '❌'}</div>
-          <div className="stat-value">{validation ? (validation.valid ? 'Intact' : `${validation.errors?.length} Tampered`) : '...'}</div>
+          <div className="stat-icon">{validation ? (validation.valid ? '✅' : '❌') : '⛓️'}</div>
+          <div className={`stat-value ${validation && !validation.valid ? 'bad' : ''}`}>
+            {validation ? (validation.valid ? 'Intact' : `${validation.errors?.length} errors`) : '…'}
+          </div>
           <div className="stat-label">Chain Integrity</div>
         </div>
         <div className="stat-card">
@@ -488,150 +593,155 @@ function LedgerExplorer() {
         </div>
       </div>
 
-      <div className="card">
-        <div className="card-header">
+      {validation && !validation.valid && (
+        <div className="alert alert-danger" role="alert">
+          <span>❌</span>
+          <span>
+            Tampering detected in block{validation.errors.length > 1 ? 's' : ''}{' '}
+            {[...new Set(validation.errors.map(e => `#${e.block_index}`))].join(', ')}.
+          </span>
+        </div>
+      )}
+
+      <div className="card flush">
+        <div className="card-header padded">
           <span className="card-title">Decryption Events</span>
-          {validation?.valid && <span className="badge-valid">✓ Chain Valid</span>}
+          {total > blocks.length && <span className="hint">Showing latest {blocks.length} of {total}</span>}
         </div>
 
         {blocks.length === 0 ? (
-          <div className="empty-state"><div className="icon">⛓️</div><p>No blocks in the chain yet. Decrypt a document to create the first block.</p></div>
+          <div className="empty-state"><div className="icon">⛓️</div><p>No blocks yet. Decrypt a document to create the first block.</p></div>
         ) : (
-          <table className="ledger-table">
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Timestamp</th>
-                <th>Recipient</th>
-                <th>Watermark ID</th>
-                <th>Block Hash</th>
-                <th>Prev Hash</th>
-              </tr>
-            </thead>
-            <tbody>
-              {blocks.map(b => (
-                <tr key={b.block_index}>
-                  <td>{b.block_index}</td>
-                  <td>{new Date(b.timestamp * 1000).toLocaleString()}</td>
-                  <td>{b.recipient_id}</td>
-                  <td className="mono">{b.watermark_id?.substring(0, 12)}...</td>
-                  <td className="mono">{b.block_hash?.substring(0, 16)}...</td>
-                  <td className="mono">{b.prev_hash?.substring(0, 16)}...</td>
+          <div className="table-wrap">
+            <table className="ledger-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Timestamp</th>
+                  <th>Recipient</th>
+                  <th>Document</th>
+                  <th>Watermark ID</th>
+                  <th>Block Hash</th>
+                  <th>Prev Hash</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {blocks.map(b => (
+                  <tr key={b.block_index}>
+                    <td>{b.block_index}</td>
+                    <td className="nowrap">{formatTime(b.timestamp)}</td>
+                    <td>{b.recipient_id}</td>
+                    <td className="mono">{b.doc_id || '—'}</td>
+                    <td className="mono" title={b.watermark_id}>{shortHash(b.watermark_id, 12)}</td>
+                    <td className="mono" title={b.block_hash}>{shortHash(b.block_hash)}</td>
+                    <td className="mono" title={b.prev_hash}>{shortHash(b.prev_hash)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
     </div>
   )
 }
 
-// ─── App ────────────────────────────────────────────────────────────
+// ─── App shell ──────────────────────────────────────────────────────
 const PAGES = [
-  { id: 'dashboard', label: 'Dashboard', icon: '📊', component: Dashboard },
-  { id: 'register', label: 'Register Users', icon: '👤', component: Register },
-  { id: 'distribute', label: 'Distribute', icon: '📤', component: Distribute },
-  { id: 'decrypt', label: 'Decrypt', icon: '🔓', component: Decrypt },
-  { id: 'investigate', label: 'Investigate', icon: '🔍', component: Investigate },
-  { id: 'ledger', label: 'Audit Ledger', icon: '⛓️', component: LedgerExplorer },
+  { id: 'dashboard', label: 'Dashboard', icon: '📊', component: Dashboard, section: 'Operations' },
+  { id: 'register', label: 'Register Users', icon: '👤', component: Register, section: 'Operations' },
+  { id: 'distribute', label: 'Distribute', icon: '📤', component: Distribute, section: 'Operations' },
+  { id: 'decrypt', label: 'Decrypt', icon: '🔓', component: Decrypt, section: 'Operations' },
+  { id: 'investigate', label: 'Investigate', icon: '🔍', component: Investigate, section: 'Forensics' },
+  { id: 'ledger', label: 'Audit Ledger', icon: '⛓️', component: LedgerExplorer, section: 'Forensics' },
 ]
+
+const ZOOM_STEPS = [0.9, 1, 1.1, 1.25]
+
+function loadPref(key, fallback) {
+  try {
+    const v = localStorage.getItem(`nishan.${key}`)
+    return v === null ? fallback : JSON.parse(v)
+  } catch { return fallback }
+}
+
+function savePref(key, value) {
+  try { localStorage.setItem(`nishan.${key}`, JSON.stringify(value)) } catch { /* ignore */ }
+}
 
 export default function App() {
   const [page, setPage] = useState('dashboard')
-  const CurrentPage = PAGES.find(p => p.id === page)?.component || Dashboard
+  const [zoomIdx, setZoomIdx] = useState(() => loadPref('zoom', 1))
+  const [highContrast, setHighContrast] = useState(() => loadPref('contrast', false))
+
+  useEffect(() => { savePref('zoom', zoomIdx) }, [zoomIdx])
+  useEffect(() => { savePref('contrast', highContrast) }, [highContrast])
+
+  const current = PAGES.find(p => p.id === page) || PAGES[0]
+  const CurrentPage = current.component
+  const sections = [...new Set(PAGES.map(p => p.section))]
 
   return (
-    <div className="app">
-      <div className="gov-header">
-        <div className="left">
-          <span>🇮🇳</span>
-          <span>Government of India | Ministry of Defence</span>
-        </div>
-        <div className="right">
-          <span>English</span>
-          <span>|</span>
-          <span>हिन्दी</span>
-        </div>
-      </div>
-      <div className="tricolor-bar"></div>
-      <div className="system-banner">
-        <span className="banner-icon">🔒</span>
-        <span>SECURE DOCUMENT DISTRIBUTION SYSTEM</span>
+    <div className="app" data-contrast={highContrast ? 'high' : undefined}>
+      <header className="classification-bar">
+        <span className="left">🔒 Secure Document Distribution System</span>
         <span className="banner-classification">RESTRICTED</span>
-      </div>
-      <div className="emblem-bar">
-        <div className="emblem">☸</div>
-        <div className="emblem-text">
-          <span className="emblem-title">NISHAN</span>
-          <span className="emblem-subtitle">Cryptographic Attribution & Immutable Decryption Provenance</span>
-        </div>
-        <div className="emblem-text right">
-          <span className="emblem-title">Ministry of Defence</span>
-          <span className="emblem-subtitle">Indian Navy — WESEE</span>
-        </div>
-      </div>
-      <div className="breadcrumb-bar">
-        <span>Home</span>
-        <span> / </span>
-        <span>Secure Document Distribution</span>
-        <span> / </span>
-        <span className="current">NISHAN Portal</span>
-      </div>
-      <div className="last-updated">
-        <span>Last Updated: </span>
-        <span>{new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}</span>
-      </div>
-      <div className="accessibility-bar">
-        <button className="accessibility-btn" title="Decrease font size">A-</button>
-        <button className="accessibility-btn" title="Reset font size">A</button>
-        <button className="accessibility-btn" title="Increase font size">A+</button>
-        <span className="accessibility-separator">|</span>
-        <button className="accessibility-btn" title="High contrast">◐</button>
-        <button className="accessibility-btn" title="Screen reader">🔊</button>
-      </div>
-      <div className="tricolor-bar"></div>
+        <span className="right">Ministry of Defence · Indian Navy (WESEE)</span>
+      </header>
+      <div className="tricolor-bar" />
+
       <div className="app-content">
-      <aside className="sidebar">
-        <div className="sidebar-logo">
-          <div className="logo-icon">N</div>
-          <div>
-            <h1>NISHAN</h1>
-            <div className="badge">DOCUMENT SECURITY</div>
+        <aside className="sidebar">
+          <div className="sidebar-logo">
+            <div className="logo-icon">N</div>
+            <div>
+              <h1>NISHAN</h1>
+              <div className="badge">DOCUMENT SECURITY</div>
+            </div>
           </div>
-        </div>
 
-        <div className="nav-section">Operations</div>
-        <ul className="nav-items">
-          {PAGES.slice(0, 4).map(p => (
-            <li key={p.id} className={`nav-item ${page === p.id ? 'active' : ''}`} onClick={() => setPage(p.id)}>
-              <span className="icon">{p.icon}</span> {p.label}
-            </li>
-          ))}
-        </ul>
+          <nav aria-label="Main">
+            {sections.map(section => (
+              <div key={section}>
+                <div className="nav-section">{section}</div>
+                <ul className="nav-items">
+                  {PAGES.filter(p => p.section === section).map(p => (
+                    <li key={p.id}>
+                      <button type="button" className={`nav-item ${page === p.id ? 'active' : ''}`}
+                        aria-current={page === p.id ? 'page' : undefined} onClick={() => setPage(p.id)}>
+                        <span className="icon">{p.icon}</span> {p.label}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </nav>
 
-        <div className="nav-section">Forensics</div>
-        <ul className="nav-items">
-          {PAGES.slice(4).map(p => (
-            <li key={p.id} className={`nav-item ${page === p.id ? 'active' : ''}`} onClick={() => setPage(p.id)}>
-              <span className="icon">{p.icon}</span> {p.label}
-            </li>
-          ))}
-        </ul>
+          <div className="sidebar-footer">
+            <div className="a11y-controls" role="group" aria-label="Display settings">
+              <button type="button" title="Smaller text" aria-label="Smaller text"
+                disabled={zoomIdx === 0} onClick={() => setZoomIdx(i => i - 1)}>A−</button>
+              <button type="button" title="Reset text size" aria-label="Reset text size"
+                onClick={() => setZoomIdx(1)}>A</button>
+              <button type="button" title="Larger text" aria-label="Larger text"
+                disabled={zoomIdx === ZOOM_STEPS.length - 1} onClick={() => setZoomIdx(i => i + 1)}>A+</button>
+              <button type="button" title="High contrast" aria-label="High contrast"
+                aria-pressed={highContrast} className={highContrast ? 'on' : ''}
+                onClick={() => setHighContrast(c => !c)}>◐</button>
+            </div>
+            <div className="org">
+              <div>Cryptographic Attribution &amp;</div>
+              <div>Immutable Decryption Provenance</div>
+            </div>
+          </div>
+        </aside>
 
-        <div style={{ marginTop: 'auto', padding: '16px 12px', borderTop: '1px solid rgba(255,255,255,0.1)' }}>
-          <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>Ministry of Defence</div>
-          <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>Government of India</div>
-        </div>
-      </aside>
-
-      <main className="main">
-        <CurrentPage />
-        <footer className="gov-footer">
-          <p>NISHAN — Cryptographic Attribution & Immutable Decryption Provenance</p>
-          <p>Ministry of Defence — Indian Navy (WESEE) | Government of India</p>
-        </footer>
-      </main>
+        <main className="main">
+          <div className="main-inner" style={{ zoom: ZOOM_STEPS[zoomIdx] ?? 1 }}>
+            <CurrentPage key={current.id} />
+          </div>
+        </main>
       </div>
     </div>
   )

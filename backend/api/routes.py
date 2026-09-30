@@ -20,6 +20,7 @@ import os
 import re
 import uuid
 from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote
 
@@ -433,7 +434,7 @@ async def investigate_document(
         "message": (
             f"ATTRIBUTION: Document was decrypted by "
             f"'{user.display_name if user else block.recipient_id}' "
-            f"at timestamp {block.timestamp}. "
+            f"at {datetime.fromtimestamp(block.timestamp, timezone.utc):%Y-%m-%d %H:%M:%S} UTC. "
             f"Digital signature {'VERIFIED ✓' if signature_valid else 'UNVERIFIED ✗'}."
             + ("" if watermark_consistent else
                " WARNING: watermark contents do not match the ledger record.")

@@ -73,12 +73,16 @@ app.add_middleware(
 app.include_router(router)
 
 
-# Health check
-@app.get("/")
-async def root():
-    return {
-        "name": "NISHAN",
-        "status": "operational",
-        "organization": "Ministry of Defence — Indian Navy (WESEE)",
-        "docs": "/docs",
-    }
+# Serve the built frontend (used by the desktop app) or a JSON health check
+_frontend_dist = os.environ.get("NISHAN_FRONTEND_DIST")
+if _frontend_dist and os.path.isfile(os.path.join(_frontend_dist, "index.html")):
+    app.mount("/", StaticFiles(directory=_frontend_dist, html=True), name="frontend")
+else:
+    @app.get("/")
+    async def root():
+        return {
+            "name": "NISHAN",
+            "status": "operational",
+            "organization": "Ministry of Defence — Indian Navy (WESEE)",
+            "docs": "/docs",
+        }
