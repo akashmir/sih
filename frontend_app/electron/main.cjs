@@ -113,14 +113,17 @@ function fail(title, detail) {
 // ─── Window ─────────────────────────────────────────────────────────
 const SPLASH = `data:text/html;charset=utf-8,${encodeURIComponent(`<!doctype html>
 <html><head><meta charset="utf-8"><style>
-  html,body{height:100%;margin:0;font-family:'Segoe UI',system-ui,sans-serif;background:#000080;color:#fff}
-  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px}
-  .logo{width:64px;height:64px;border-radius:8px;background:#FF9933;display:flex;align-items:center;
-        justify-content:center;font-size:32px;font-weight:800}
-  .bar{width:180px;height:4px;background:linear-gradient(90deg,#FF9933 0 33.3%,#fff 33.3% 66.6%,#138808 66.6%)}
-  p{margin:0;opacity:.75;font-size:13px}
+  html,body{height:100%;margin:0;font-family:'Segoe UI',system-ui,sans-serif;background:#f5f6f8;color:#1b2330}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}
+  .brand{display:flex;align-items:center;gap:12px;font-size:22px;font-weight:700;letter-spacing:.08em}
+  .mark{width:40px;height:40px;border-radius:9px;background:#1e4e8c;color:#fff;display:grid;place-items:center;
+        font-size:20px;letter-spacing:0}
+  .bar{width:160px;height:3px;border-radius:2px;background:#e3e6eb;overflow:hidden}
+  .bar::after{content:"";display:block;width:40%;height:100%;background:#1e4e8c;animation:slide 1.1s ease-in-out infinite}
+  @keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(250%)}}
+  p{margin:0;color:#6b7686;font-size:13px}
 </style></head><body>
-  <div class="logo">N</div><strong>NISHAN</strong><div class="bar"></div><p>Starting secure backend…</p>
+  <div class="brand"><div class="mark">N</div>NISHAN</div><div class="bar"></div><p>Starting…</p>
 </body></html>`)}`
 
 function createWindow() {
@@ -131,7 +134,7 @@ function createWindow() {
     minHeight: 640,
     title: 'NISHAN',
     icon: fs.existsSync(ICON) ? ICON : undefined,
-    backgroundColor: '#000080',
+    backgroundColor: '#f5f6f8',
     autoHideMenuBar: true,
     webPreferences: {
       contextIsolation: true,
