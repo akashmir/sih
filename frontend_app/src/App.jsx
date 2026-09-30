@@ -4,23 +4,43 @@ import './index.css'
 const API = ''  // Same origin: Vite proxy in dev, the backend itself in the desktop app
 
 // ─── API helpers ────────────────────────────────────────────────────
-async function api(path, opts = {}) {
-  const res = await fetch(`${API}${path}`, opts)
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }))
-    throw new Error(err.detail || 'Request failed')
-  }
+async function readError(res) {
+  const err = await res.json().catch(() => ({ detail: res.statusText }))
+  return new Error(friendlyError(err.detail || 'Request failed'))
+}
+
+async function api(path) {
+  const res = await fetch(`${API}${path}`)
+  if (!res.ok) throw await readError(res)
   return res.json()
 }
 
-// POST a form and return the raw response, throwing the server's error detail
 async function postForm(path, form) {
   const res = await fetch(`${API}${path}`, { method: 'POST', body: form })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }))
-    throw new Error(err.detail || 'Request failed')
-  }
+  if (!res.ok) throw await readError(res)
   return res
+}
+
+// Translate server messages into plain language
+function friendlyError(msg) {
+  const rules = [
+    [/Failed to fetch|NetworkError/i, 'Can’t connect to the NISHAN service. Make sure it is running.'],
+    [/Invalid key file/i, 'That file isn’t a valid access key.'],
+    [/Key file does not match/i, 'This access key belongs to a different person.'],
+    [/Key file was generated for/i, 'This access key was created with an older version of NISHAN. Please add the recipient again.'],
+    [/decapsulation failed|Decryption failed/i, 'This access key can’t open this document.'],
+    [/not an authorized recipient/i, 'You are not one of the recipients of this document.'],
+    [/Document not found/i, 'This document is no longer available.'],
+    [/already exists/i, 'Someone with this username already exists.'],
+    [/User ID must be/i, 'Usernames can only use letters, numbers, dots, dashes and underscores.'],
+    [/Unsupported file type/i, 'This file type isn’t supported. Use a text, PDF or image file.'],
+    [/must be UTF-8/i, 'This text file uses an unsupported character encoding. Save it as UTF-8 and try again.'],
+    [/Image too small/i, 'This image is too small to be protected. Use a larger image.'],
+    [/not a readable (image|PDF)|PDF has no pages/i, 'This file appears to be damaged or empty.'],
+    [/Recipient '.*' not found/i, 'One of the selected recipients no longer exists.'],
+  ]
+  const hit = rules.find(([re]) => re.test(msg))
+  return hit ? hit[1] : msg
 }
 
 // Filename from a Content-Disposition header, preferring the RFC 5987 form
@@ -43,423 +63,420 @@ function downloadBlob(blob, filename) {
   URL.revokeObjectURL(url)
 }
 
-const shortAlg = alg => alg?.replace(/\s*\(classical fallback\)/, '') ?? '…'
-const shortHash = (h, n = 16) => (h ? `${h.substring(0, n)}…` : '—')
-const formatTime = ts => new Date(ts * 1000).toLocaleString('en-IN')
+const formatTime = ts => new Date(ts * 1000).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })
 
-const SUPPORTED = '.txt .md .csv .json .xml .html .log .pdf .png .jpg .bmp'
+// Lookup tables so screens can show names instead of IDs
+function useDirectory() {
+  const [users, setUsers] = useState([])
+  const [docs, setDocs] = useState([])
+  const [loaded, setLoaded] = useState(false)
+  const reload = useCallback(() => Promise.all([
+    api('/api/users').then(setUsers).catch(() => {}),
+    api('/api/documents').then(setDocs).catch(() => {}),
+  ]).finally(() => setLoaded(true)), [])
+  useEffect(() => { reload() }, [reload])
+
+  const userName = id => users.find(u => u.user_id === id)?.display_name || id
+  const docName = id => docs.find(d => d.doc_id === id)?.filename
+  return { users, docs, loaded, userName, docName, reload }
+}
 
 // ─── Shared UI ──────────────────────────────────────────────────────
 function PageHeader({ title, subtitle, children }) {
   return (
-    <div className="page-header">
+    <header className="page-header">
       <div>
-        <h2>{title}</h2>
-        <p>{subtitle}</p>
+        <h1>{title}</h1>
+        {subtitle && <p>{subtitle}</p>}
       </div>
       {children && <div className="page-actions">{children}</div>}
+    </header>
+  )
+}
+
+function Notice({ tone = 'info', title, children }) {
+  return (
+    <div className={`notice notice-${tone}`} role={tone === 'error' ? 'alert' : 'status'}>
+      {title && <strong>{title}</strong>}
+      {children && <div>{children}</div>}
     </div>
   )
 }
 
-function Row({ label, children, mono = true }) {
+function FilePicker({ id, file, onChange, prompt, hint, accept }) {
   return (
-    <div className="result-row">
-      <span className="label">{label}</span>
-      <span className={mono ? 'value' : 'value plain'}>{children}</span>
-    </div>
-  )
-}
-
-function Status({ status }) {
-  if (!status) return null
-  const cls = { success: 'success', error: 'danger', loading: '', warning: 'warning' }[status.type]
-  const icon = { success: '✅', error: '❌', loading: '⏳', warning: '⚠️' }[status.type]
-  return (
-    <div className={`result-box ${cls}`} role={status.type === 'error' ? 'alert' : 'status'}>
-      <h4>{icon} {status.msg}</h4>
-      {status.children}
-    </div>
-  )
-}
-
-function FilePicker({ file, onChange, icon, prompt, hint, accept }) {
-  return (
-    <label className={`file-input-wrapper ${file ? 'has-file' : ''}`}>
-      <input type="file" accept={accept} onChange={e => onChange(e.target.files[0] || null)} />
-      <div className="icon">{file ? '📄' : icon}</div>
-      <div className="label">{file ? file.name : prompt}</div>
-      {hint && <div className="sublabel">{hint}</div>}
+    <label htmlFor={id} className={`file-drop ${file ? 'has-file' : ''}`}>
+      <input id={id} type="file" accept={accept} onChange={e => onChange(e.target.files[0] || null)} />
+      <span className="file-drop-button">{file ? 'Change file' : 'Choose file'}</span>
+      <span className="file-drop-name">{file ? file.name : prompt}</span>
+      {hint && !file && <span className="file-drop-hint">{hint}</span>}
     </label>
   )
 }
 
-// ─── Dashboard ──────────────────────────────────────────────────────
-function Dashboard() {
-  const [info, setInfo] = useState(null)
-  const [chain, setChain] = useState(null)
-  const [error, setError] = useState(null)
-
-  useEffect(() => {
-    api('/api/system/info').then(setInfo).catch(e => setError(e.message))
-    api('/api/ledger/verify').then(setChain).catch(() => {})
-  }, [])
-
-  const pq = info?.crypto?.post_quantum
-
+function Field({ label, htmlFor, hint, error, children }) {
   return (
-    <div className="animate-in">
-      <PageHeader title="Dashboard" subtitle="System overview and health status" />
-
-      {error && (
-        <div className="alert alert-danger" role="alert">
-          <span>⚠️</span>
-          <span>Cannot reach the NISHAN backend ({error}). Make sure it is running.</span>
-        </div>
-      )}
-
-      <div className="stats-grid">
-        <div className="stat-card">
-          <div className="stat-icon">🔐</div>
-          <div className="stat-value small">{shortAlg(info?.crypto?.kem_algorithm)}</div>
-          <div className="stat-label">Key Encapsulation</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-icon">✍️</div>
-          <div className="stat-value small">{shortAlg(info?.crypto?.sig_algorithm)}</div>
-          <div className="stat-label">Digital Signatures</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-icon">{chain ? (chain.valid ? '✅' : '❌') : '⛓️'}</div>
-          <div className={`stat-value ${chain && !chain.valid ? 'bad' : ''}`}>
-            {chain ? (chain.valid ? 'Valid' : 'Tampered') : '…'}
-          </div>
-          <div className="stat-label">Chain Integrity</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-icon">👥</div>
-          <div className="stat-value">{info?.registered_users ?? '…'}</div>
-          <div className="stat-label">Registered Users</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-icon">📄</div>
-          <div className="stat-value">{info?.documents_encrypted ?? '…'}</div>
-          <div className="stat-label">Documents Encrypted</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-icon">📦</div>
-          <div className="stat-value">{info?.chain_length ?? '…'}</div>
-          <div className="stat-label">Ledger Blocks</div>
-        </div>
-      </div>
-
-      <div className="grid-2">
-        <div className="card">
-          <div className="card-header"><span className="card-title">Cryptographic Backend</span></div>
-          {info && (
-            <div className={`alert ${pq ? 'alert-success' : 'alert-warning'}`}>
-              <span>{pq ? '🛡️' : 'ℹ️'}</span>
-              <span>
-                {pq
-                  ? 'Post-quantum algorithms active (NIST FIPS 203 / 204).'
-                  : 'Classical fallback active (X25519 / Ed25519) — not quantum-safe. Install liboqs-python to enable ML-KEM / ML-DSA.'}
-              </span>
-            </div>
-          )}
-          {info?.crypto && Object.entries(info.crypto).map(([k, v]) => (
-            <Row key={k} label={k.replace(/_/g, ' ')}>{String(v)}</Row>
-          ))}
-        </div>
-        <div className="card">
-          <div className="card-header"><span className="card-title">System</span></div>
-          {info && (
-            <>
-              <Row label="Project">{info.project}</Row>
-              <Row label="Version">{info.version}</Row>
-              <Row label="Organization" mono={false}>{info.organization}</Row>
-              <Row label="Chain checked">{chain ? `${chain.blocks_checked} blocks` : '…'}</Row>
-            </>
-          )}
-        </div>
-      </div>
+    <div className="field">
+      <label className="field-label" htmlFor={htmlFor}>{label}</label>
+      {children}
+      {(error || hint) && <div className={`field-hint ${error ? 'error' : ''}`}>{error || hint}</div>}
     </div>
   )
 }
 
-// ─── Register ───────────────────────────────────────────────────────
-function Register() {
+function Empty({ children }) {
+  return <div className="empty">{children}</div>
+}
+
+// ─── Overview ───────────────────────────────────────────────────────
+function Overview({ onNavigate }) {
+  const [info, setInfo] = useState(null)
+  const [chain, setChain] = useState(null)
+  const [recent, setRecent] = useState(null)
+  const [error, setError] = useState(null)
+  const { userName, docName } = useDirectory()
+
+  useEffect(() => {
+    api('/api/system/info').then(setInfo).catch(e => setError(e.message))
+    api('/api/ledger/verify').then(setChain).catch(() => {})
+    api('/api/ledger/blocks?limit=6').then(d => setRecent(d.blocks)).catch(() => setRecent([]))
+  }, [])
+
+  return (
+    <>
+      <PageHeader title="Overview" subtitle="A summary of your documents and recent activity." />
+
+      {error && <Notice tone="error" title="Can’t connect to the NISHAN service">Make sure it is running, then reopen this page.</Notice>}
+
+      <div className="stats">
+        <div className="stat">
+          <div className="stat-label">Recipients</div>
+          <div className="stat-value">{info?.registered_users ?? '–'}</div>
+        </div>
+        <div className="stat">
+          <div className="stat-label">Documents shared</div>
+          <div className="stat-value">{info?.documents_encrypted ?? '–'}</div>
+        </div>
+        <div className="stat">
+          <div className="stat-label">Times opened</div>
+          <div className="stat-value">{info?.chain_length ?? '–'}</div>
+        </div>
+        <div className="stat">
+          <div className="stat-label">Activity log</div>
+          <div className={`stat-value status ${chain ? (chain.valid ? 'ok' : 'bad') : ''}`}>
+            {chain ? (chain.valid ? 'Verified' : 'Needs attention') : '–'}
+          </div>
+        </div>
+      </div>
+
+      <div className="columns">
+        <section className="panel">
+          <div className="panel-header">
+            <h2>Recent activity</h2>
+            <button type="button" className="link" onClick={() => onNavigate('ledger')}>View all</button>
+          </div>
+          {recent === null ? (
+            <Empty>Loading…</Empty>
+          ) : recent.length === 0 ? (
+            <Empty>No documents have been opened yet.</Empty>
+          ) : (
+            <ul className="activity">
+              {recent.map(b => (
+                <li key={b.block_index}>
+                  <div>
+                    <strong>{userName(b.recipient_id)}</strong> opened{' '}
+                    <strong>{docName(b.doc_id) || 'a document'}</strong>
+                  </div>
+                  <time>{formatTime(b.timestamp)}</time>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        <section className="panel">
+          <div className="panel-header"><h2>Get started</h2></div>
+          <div className="actions">
+            <button type="button" className="action" onClick={() => onNavigate('recipients')}>
+              <strong>Add a recipient</strong>
+              <span>Create an access key for a new person.</span>
+            </button>
+            <button type="button" className="action" onClick={() => onNavigate('share')}>
+              <strong>Share a document</strong>
+              <span>Protect a file so only chosen recipients can open it.</span>
+            </button>
+            <button type="button" className="action" onClick={() => onNavigate('trace')}>
+              <strong>Trace a leaked copy</strong>
+              <span>Find out whose copy of a document was leaked.</span>
+            </button>
+          </div>
+        </section>
+      </div>
+    </>
+  )
+}
+
+// ─── Recipients ─────────────────────────────────────────────────────
+function Recipients() {
   const [userId, setUserId] = useState('')
   const [name, setName] = useState('')
   const [status, setStatus] = useState(null)
-  const [users, setUsers] = useState([])
-
-  const loadUsers = useCallback(() => {
-    api('/api/users').then(setUsers).catch(() => {})
-  }, [])
-
-  useEffect(() => { loadUsers() }, [loadUsers])
+  const [busy, setBusy] = useState(false)
+  const { users, loaded, reload } = useDirectory()
 
   const validId = /^[A-Za-z0-9_.-]{1,64}$/.test(userId)
 
   const register = async e => {
     e.preventDefault()
+    setBusy(true)
+    setStatus(null)
     try {
-      setStatus({ type: 'loading', msg: 'Generating keypairs…' })
       const form = new FormData()
       form.append('user_id', userId)
-      form.append('display_name', name)
+      form.append('display_name', name.trim())
       const res = await postForm('/api/users/register', form)
       const filename = dispositionFilename(res.headers.get('Content-Disposition'), `${userId}_private_keys.key`)
       downloadBlob(await res.blob(), filename)
       setStatus({
-        type: 'success',
-        msg: `Registered ${name}`,
-        children: (
-          <p className="hint">
-            Private key saved as <strong>{filename}</strong>. This is the only copy — store it securely;
-            it is needed to decrypt documents.
-          </p>
-        ),
+        tone: 'success',
+        title: `${name.trim()} has been added`,
+        body: <>Their access key was saved as <strong>{filename}</strong>. Give it to them securely — it is the only copy and cannot be recovered.</>,
       })
       setUserId('')
       setName('')
-      loadUsers()
+      reload()
     } catch (err) {
-      setStatus({ type: 'error', msg: err.message })
+      setStatus({ tone: 'error', title: 'Could not add recipient', body: err.message })
     }
+    setBusy(false)
   }
 
   return (
-    <div className="animate-in">
-      <PageHeader
-        title="Register Recipients"
-        subtitle="Generate recipient keypairs. The private key is saved to your computer; the server keeps only public keys."
-      />
+    <>
+      <PageHeader title="Recipients" subtitle="People who can receive protected documents." />
 
-      <div className="grid-2">
-        <form className="card" onSubmit={register}>
-          <div className="card-header"><span className="card-title">New Recipient</span></div>
-          <div className="form-group">
-            <label htmlFor="reg-id">User ID</label>
-            <input id="reg-id" className="form-input" placeholder="e.g. admiral_kumar" value={userId}
-              onChange={e => setUserId(e.target.value)} aria-invalid={userId !== '' && !validId} />
-            <div className={`field-hint ${userId && !validId ? 'error' : ''}`}>
-              Letters, digits, <code>_</code> <code>.</code> <code>-</code> — up to 64 characters
-            </div>
-          </div>
-          <div className="form-group">
-            <label htmlFor="reg-name">Display Name</label>
-            <input id="reg-name" className="form-input" placeholder="e.g. Admiral R. Kumar" value={name}
+      <div className="columns">
+        <form className="panel" onSubmit={register}>
+          <div className="panel-header"><h2>Add a recipient</h2></div>
+          <Field label="Full name" htmlFor="reg-name">
+            <input id="reg-name" className="input" placeholder="e.g. Cdr. A. Mehta" value={name}
               onChange={e => setName(e.target.value)} />
-          </div>
-          <button type="submit" className="btn btn-primary"
-            disabled={!validId || !name.trim() || status?.type === 'loading'}>
-            🔑 Generate Keys & Register
+          </Field>
+          <Field label="Username" htmlFor="reg-id"
+            hint="Letters, numbers, dots, dashes and underscores."
+            error={userId && !validId ? 'Usernames can only use letters, numbers, dots, dashes and underscores.' : null}>
+            <input id="reg-id" className="input" placeholder="e.g. a.mehta" value={userId}
+              onChange={e => setUserId(e.target.value)} aria-invalid={userId !== '' && !validId} />
+          </Field>
+          <p className="muted small form-note">
+            An access key file will be saved to this computer. The recipient needs it to open documents.
+          </p>
+          <button type="submit" className="btn btn-primary" disabled={!validId || !name.trim() || busy}>
+            {busy ? 'Adding…' : 'Add recipient'}
           </button>
-          <Status status={status} />
+          {status && <Notice tone={status.tone} title={status.title}>{status.body}</Notice>}
         </form>
-        <div className="card">
-          <div className="card-header">
-            <span className="card-title">Registered Recipients</span>
-            <span className="count">{users.length}</span>
+
+        <section className="panel">
+          <div className="panel-header">
+            <h2>All recipients</h2>
+            <span className="muted small">{users.length}</span>
           </div>
-          {users.length === 0 ? (
-            <div className="empty-state"><div className="icon">👤</div><p>No users registered yet</p></div>
+          {!loaded ? (
+            <Empty>Loading…</Empty>
+          ) : users.length === 0 ? (
+            <Empty>No recipients yet.</Empty>
           ) : (
-            <div className="scroll-list">
+            <ul className="people">
               {users.map(u => (
-                <Row key={u.user_id} label={u.display_name}>{u.user_id}</Row>
+                <li key={u.user_id}>
+                  <span className="avatar" aria-hidden="true">{u.display_name.trim().charAt(0).toUpperCase()}</span>
+                  <span className="person">
+                    <strong>{u.display_name}</strong>
+                    <span className="muted small">{u.user_id}</span>
+                  </span>
+                  <span className="muted small">Added {new Date(u.registered_at * 1000).toLocaleDateString('en-IN', { dateStyle: 'medium' })}</span>
+                </li>
               ))}
-            </div>
+            </ul>
           )}
-        </div>
+        </section>
       </div>
-    </div>
+    </>
   )
 }
 
-// ─── Distribute ─────────────────────────────────────────────────────
-function Distribute() {
+// ─── Share Document ─────────────────────────────────────────────────
+function ShareDocument() {
   const [file, setFile] = useState(null)
-  const [users, setUsers] = useState([])
   const [selected, setSelected] = useState([])
   const [status, setStatus] = useState(null)
-
-  useEffect(() => { api('/api/users').then(setUsers).catch(() => {}) }, [])
+  const [busy, setBusy] = useState(false)
+  const { users, loaded, userName } = useDirectory()
 
   const toggle = id => setSelected(s => s.includes(id) ? s.filter(x => x !== id) : [...s, id])
   const allSelected = users.length > 0 && selected.length === users.length
 
-  const encrypt = async () => {
-    setStatus({ type: 'loading', msg: 'Encrypting…' })
+  const share = async () => {
+    setBusy(true)
+    setStatus(null)
     try {
       const form = new FormData()
       form.append('document', file)
       form.append('recipients', selected.join(','))
       const res = await (await postForm('/api/documents/encrypt', form)).json()
       setStatus({
-        type: 'success',
-        msg: res.message,
-        children: (
-          <>
-            <Row label="Document ID">{res.doc_id}</Row>
-            <Row label="Filename">{res.filename}</Row>
-            <Row label="SHA-256">{shortHash(res.doc_hash, 24)}</Row>
-            <Row label="Recipients">{res.recipients.join(', ')}</Row>
-          </>
-        ),
+        tone: 'success',
+        title: `${res.filename} is ready`,
+        body: `It can now be opened by ${res.recipients.map(userName).join(', ')}.`,
       })
       setFile(null)
       setSelected([])
     } catch (e) {
-      setStatus({ type: 'error', msg: e.message })
+      setStatus({ tone: 'error', title: 'Could not share document', body: e.message })
     }
+    setBusy(false)
   }
 
   return (
-    <div className="animate-in">
-      <PageHeader title="Distribute Document" subtitle="Encrypt a document once for multiple recipients" />
+    <>
+      <PageHeader title="Share Document"
+        subtitle="Protect a file so only the people you choose can open it. Each person receives a personally marked copy." />
 
-      <div className="card">
-        <div className="form-group">
-          <label>Document</label>
-          <FilePicker file={file} onChange={setFile} icon="📁"
-            prompt="Click to select a document" hint={`Supported: ${SUPPORTED}`} />
-        </div>
+      <section className="panel narrow">
+        <Field label="Document">
+          <FilePicker id="share-file" file={file} onChange={setFile} prompt="No file selected"
+            hint="Text, PDF and image files (PNG, JPG, BMP)" />
+        </Field>
 
-        <div className="form-group">
-          <div className="label-row">
-            <label>Recipients {selected.length > 0 && <span className="count">{selected.length}</span>}</label>
+        <div className="field">
+          <div className="field-label-row">
+            <span className="field-label">Recipients{selected.length > 0 && ` (${selected.length} selected)`}</span>
             {users.length > 0 && (
-              <button type="button" className="link-btn"
+              <button type="button" className="link"
                 onClick={() => setSelected(allSelected ? [] : users.map(u => u.user_id))}>
-                {allSelected ? 'Clear all' : 'Select all'}
+                {allSelected ? 'Clear selection' : 'Select all'}
               </button>
             )}
           </div>
-          {users.length === 0 ? (
-            <div className="alert alert-warning"><span>⚠️</span><span>No registered users. Register recipients first.</span></div>
+          {!loaded ? (
+            <div className="muted">Loading…</div>
+          ) : users.length === 0 ? (
+            <Notice tone="warning">Add recipients before sharing a document.</Notice>
           ) : (
-            <div className="chip-list">
+            <div className="checklist">
               {users.map(u => (
-                <button type="button" key={u.user_id} title={u.user_id}
-                  className={`chip ${selected.includes(u.user_id) ? 'selected' : ''}`}
-                  aria-pressed={selected.includes(u.user_id)} onClick={() => toggle(u.user_id)}>
-                  {u.display_name}
-                </button>
+                <label key={u.user_id} className={`check ${selected.includes(u.user_id) ? 'on' : ''}`}>
+                  <input type="checkbox" checked={selected.includes(u.user_id)} onChange={() => toggle(u.user_id)} />
+                  <span>{u.display_name}</span>
+                  <span className="muted small">{u.user_id}</span>
+                </label>
               ))}
             </div>
           )}
         </div>
 
-        <button className="btn btn-primary" onClick={encrypt}
-          disabled={!file || selected.length === 0 || status?.type === 'loading'}>
-          {status?.type === 'loading' ? '⏳ Encrypting…' : '🔐 Encrypt & Distribute'}
+        <button className="btn btn-primary" onClick={share} disabled={!file || selected.length === 0 || busy}>
+          {busy ? 'Sharing…' : 'Share document'}
         </button>
 
-        <Status status={status} />
-      </div>
-    </div>
+        {status && <Notice tone={status.tone} title={status.title}>{status.body}</Notice>}
+      </section>
+    </>
   )
 }
 
-// ─── Decrypt ────────────────────────────────────────────────────────
-function Decrypt() {
-  const [docs, setDocs] = useState([])
+// ─── Open Document ──────────────────────────────────────────────────
+function OpenDocument() {
   const [docId, setDocId] = useState('')
   const [userId, setUserId] = useState('')
   const [keyFile, setKeyFile] = useState(null)
   const [status, setStatus] = useState(null)
-
-  useEffect(() => { api('/api/documents').then(setDocs).catch(() => {}) }, [])
+  const [busy, setBusy] = useState(false)
+  const { docs, userName } = useDirectory()
 
   const doc = docs.find(d => d.doc_id === docId)
 
-  const decrypt = async () => {
-    setStatus({ type: 'loading', msg: 'Decrypting & watermarking…' })
+  const open = async () => {
+    setBusy(true)
+    setStatus(null)
     try {
       const form = new FormData()
       form.append('doc_id', docId)
       form.append('user_id', userId)
       form.append('key_file', keyFile)
       const res = await postForm('/api/documents/decrypt', form)
-      const filename = dispositionFilename(res.headers.get('Content-Disposition'), 'decrypted_document')
+      const filename = dispositionFilename(res.headers.get('Content-Disposition'), 'document')
       downloadBlob(await res.blob(), filename)
       setStatus({
-        type: 'success',
-        msg: `Saved ${filename}`,
-        children: (
-          <>
-            <Row label="Watermark ID">{res.headers.get('X-Watermark-Id')}</Row>
-            <Row label="Ledger block">#{res.headers.get('X-Block-Index')}</Row>
-            <Row label="Block hash">{shortHash(res.headers.get('X-Block-Hash'), 24)}</Row>
-            <Row label="Signed with">{res.headers.get('X-Signed-With')}</Row>
-          </>
-        ),
+        tone: 'success',
+        title: 'Your copy has been saved',
+        body: <>Saved as <strong>{filename}</strong>. This copy is personally marked to you, and the access has been recorded.</>,
       })
     } catch (e) {
-      setStatus({ type: 'error', msg: e.message })
+      setStatus({ tone: 'error', title: 'Could not open document', body: e.message })
     }
+    setBusy(false)
   }
 
   return (
-    <div className="animate-in">
-      <PageHeader title="Decrypt Document"
-        subtitle="Decrypt your copy — a unique, invisible forensic watermark is embedded and the event is logged" />
+    <>
+      <PageHeader title="Open Document"
+        subtitle="Open a document that was shared with you, using your access key." />
 
-      <div className="alert alert-info">
-        <span>🔒</span>
-        <span>Every decryption is signed with your key and recorded in the audit ledger. Your copy carries a watermark that identifies you.</span>
-      </div>
+      <section className="panel narrow">
+        <Field label="Document" htmlFor="open-doc">
+          <select id="open-doc" className="input" value={docId}
+            onChange={e => { setDocId(e.target.value); setUserId('') }}>
+            <option value="">Select a document</option>
+            {docs.map(d => <option key={d.doc_id} value={d.doc_id}>{d.filename}</option>)}
+          </select>
+        </Field>
 
-      <div className="card">
-        <div className="grid-2 tight">
-          <div className="form-group">
-            <label htmlFor="dec-doc">Document</label>
-            <select id="dec-doc" className="form-select" value={docId}
-              onChange={e => { setDocId(e.target.value); setUserId('') }}>
-              <option value="">Select a document…</option>
-              {docs.map(d => (
-                <option key={d.doc_id} value={d.doc_id}>{d.filename} ({d.doc_id})</option>
-              ))}
-            </select>
-          </div>
+        <Field label="Your name" htmlFor="open-user">
+          <select id="open-user" className="input" value={userId} disabled={!doc}
+            onChange={e => setUserId(e.target.value)}>
+            <option value="">{doc ? 'Select your name' : 'Select a document first'}</option>
+            {doc?.recipients.map(r => <option key={r} value={r}>{userName(r)}</option>)}
+          </select>
+        </Field>
 
-          <div className="form-group">
-            <label htmlFor="dec-user">Recipient</label>
-            <select id="dec-user" className="form-select" value={userId} disabled={!doc}
-              onChange={e => setUserId(e.target.value)}>
-              <option value="">{doc ? 'Select your user ID…' : 'Select a document first'}</option>
-              {doc?.recipients.map(r => <option key={r} value={r}>{r}</option>)}
-            </select>
-          </div>
-        </div>
+        <Field label="Access key">
+          <FilePicker id="open-key" file={keyFile} onChange={setKeyFile} accept=".key"
+            prompt="No file selected" hint="The .key file you received when you were added" />
+        </Field>
 
-        <div className="form-group">
-          <label>Private Key File (.key)</label>
-          <FilePicker file={keyFile} onChange={setKeyFile} icon="🔑" accept=".key"
-            prompt="Select your .key file" hint="The private key file saved when you registered" />
-        </div>
-
-        <button className="btn btn-primary" onClick={decrypt}
-          disabled={!docId || !userId || !keyFile || status?.type === 'loading'}>
-          {status?.type === 'loading' ? '⏳ Decrypting…' : '🔓 Decrypt Document'}
+        <button className="btn btn-primary" onClick={open} disabled={!docId || !userId || !keyFile || busy}>
+          {busy ? 'Opening…' : 'Open document'}
         </button>
 
-        <Status status={status} />
-      </div>
-    </div>
+        {status && <Notice tone={status.tone} title={status.title}>{status.body}</Notice>}
+      </section>
+    </>
   )
 }
 
-// ─── Investigate ────────────────────────────────────────────────────
-function Investigate() {
+// ─── Trace Leak ─────────────────────────────────────────────────────
+function Check({ ok, good, bad, detail }) {
+  return (
+    <li className={`check-item ${ok ? 'ok' : 'bad'}`}>
+      <span className="dot" aria-hidden="true" />
+      <div>
+        <strong>{ok ? good : bad}</strong>
+        <span className="muted small">{detail}</span>
+      </div>
+    </li>
+  )
+}
+
+function TraceLeak() {
   const [file, setFile] = useState(null)
   const [result, setResult] = useState(null)
-  const [loading, setLoading] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const { docName } = useDirectory()
 
-  const investigate = async () => {
-    setLoading(true)
+  const trace = async () => {
+    setBusy(true)
     setResult(null)
     try {
       const form = new FormData()
@@ -468,88 +485,86 @@ function Investigate() {
     } catch (e) {
       setResult({ error: e.message })
     }
-    setLoading(false)
+    setBusy(false)
   }
 
   const attr = result?.attribution
   const proof = result?.ledger_proof
-  const trusted = attr?.signature_verified && attr?.watermark_consistent
+  const confirmed = attr?.signature_verified && attr?.watermark_consistent
 
   return (
-    <div className="animate-in">
-      <PageHeader title="Forensic Investigation"
-        subtitle="Upload a leaked copy to extract its watermark and identify the responsible recipient" />
+    <>
+      <PageHeader title="Trace Leak"
+        subtitle="Upload a leaked copy of a document to find out whose copy it was." />
 
-      <div className="card">
-        <div className="form-group">
-          <label>Suspected Leaked Document</label>
-          <FilePicker file={file} onChange={f => { setFile(f); setResult(null) }} icon="🕵️"
-            prompt="Select the leaked document" />
-        </div>
+      <section className="panel narrow">
+        <Field label="Leaked file">
+          <FilePicker id="trace-file" file={file} onChange={f => { setFile(f); setResult(null) }}
+            prompt="No file selected" />
+        </Field>
 
-        <button className="btn btn-danger" onClick={investigate} disabled={!file || loading}>
-          {loading ? '⏳ Analyzing…' : '🔍 Investigate Document'}
+        <button className="btn btn-primary" onClick={trace} disabled={!file || busy}>
+          {busy ? 'Checking…' : 'Trace this file'}
         </button>
 
-        {result?.error && <Status status={{ type: 'error', msg: result.error }} />}
+        {result?.error && <Notice tone="error" title="Could not check this file">{result.error}</Notice>}
 
-        {result && !result.error && !result.ledger_match && (
-          <Status status={{
-            type: 'warning',
-            msg: result.message,
-            children: result.watermark_id && <Row label="Watermark ID">{result.watermark_id}</Row>,
-          }} />
+        {result && !result.error && !result.found && (
+          <Notice tone="warning" title="No tracking mark found">
+            This file may not have been shared through NISHAN, or its tracking mark was removed.
+          </Notice>
         )}
 
-        {result?.ledger_match && (
-          <div className={`result-box ${trusted ? 'success' : 'danger'}`}>
-            <h4>🎯 Attribution {trusted ? 'Established' : 'Found — Verification Failed'}</h4>
-            <div className={`alert ${trusted ? 'alert-success' : 'alert-danger'}`}>
-              <span>{trusted ? '✅' : '⚠️'}</span>
-              <span>{result.message}</span>
-            </div>
-
-            <div className="grid-2 tight">
-              <div>
-                <h5>Recipient</h5>
-                <Row label="Name" mono={false}>{attr.recipient_name}</Row>
-                <Row label="User ID">{attr.recipient_id}</Row>
-                <Row label="Decrypted at" mono={false}>{formatTime(attr.decryption_timestamp)}</Row>
-                <Row label="Document ID">{attr.doc_id}</Row>
-                <Row label="Document hash">{shortHash(attr.document_hash, 24)}</Row>
-              </div>
-              <div>
-                <h5>Evidence</h5>
-                <Row label="Watermark ID">{result.watermark_id}</Row>
-                <Row label="Signature" mono={false}>
-                  {attr.signature_verified
-                    ? <span className="badge-valid">✓ Verified</span>
-                    : <span className="badge-invalid">✗ Unverified</span>}
-                </Row>
-                <Row label="Watermark ↔ Ledger" mono={false}>
-                  {attr.watermark_consistent
-                    ? <span className="badge-valid">✓ Consistent</span>
-                    : <span className="badge-invalid">✗ Mismatch</span>}
-                </Row>
-                <Row label="Algorithm">{attr.signature_algorithm}</Row>
-                <Row label="Ledger block">#{proof.block_index}</Row>
-                <Row label="Block hash">{shortHash(proof.block_hash, 24)}</Row>
-                <Row label="Previous hash">{shortHash(proof.prev_hash, 24)}</Row>
-              </div>
-            </div>
-          </div>
+        {result?.found && !result.ledger_match && (
+          <Notice tone="warning" title="No matching record">
+            This file carries a NISHAN tracking mark, but no matching access record was found on this system.
+          </Notice>
         )}
-      </div>
-    </div>
+      </section>
+
+      {result?.ledger_match && (
+        <section className={`panel narrow verdict ${confirmed ? 'ok' : 'bad'}`}>
+          <div className="verdict-label">{confirmed ? 'Traced to' : 'Possible match'}</div>
+          <div className="verdict-name">{attr.recipient_name}</div>
+          <p>
+            This copy of <strong>{docName(attr.doc_id) || 'the document'}</strong> was opened
+            by {attr.recipient_name} ({attr.recipient_id}) on {formatTime(attr.decryption_timestamp)}.
+          </p>
+
+          <ul className="checks">
+            <Check ok={attr.signature_verified}
+              good="Identity confirmed" bad="Identity could not be confirmed"
+              detail="The access record is signed with this recipient’s own access key." />
+            <Check ok={attr.watermark_consistent}
+              good="Record matches the file" bad="Record does not match the file"
+              detail="The tracking mark in the file agrees with the stored access record." />
+          </ul>
+
+          <details className="technical">
+            <summary>Technical details (for investigators)</summary>
+            <dl>
+              <dt>Tracking ID</dt><dd>{result.watermark_id}</dd>
+              <dt>Document ID</dt><dd>{attr.doc_id}</dd>
+              <dt>Document fingerprint</dt><dd>{attr.document_hash}</dd>
+              <dt>Access record</dt><dd>#{proof.block_index}</dd>
+              <dt>Record fingerprint</dt><dd>{proof.block_hash}</dd>
+              <dt>Previous record</dt><dd>{proof.prev_hash}</dd>
+              <dt>Signature method</dt><dd>{attr.signature_algorithm}</dd>
+            </dl>
+          </details>
+        </section>
+      )}
+    </>
   )
 }
 
-// ─── Ledger Explorer ────────────────────────────────────────────────
-function LedgerExplorer() {
-  const [blocks, setBlocks] = useState([])
+// ─── Activity Log ───────────────────────────────────────────────────
+function ActivityLog() {
+  const [blocks, setBlocks] = useState(null)
   const [total, setTotal] = useState(0)
   const [validation, setValidation] = useState(null)
-  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(true)
+  const { userName, docName } = useDirectory()
 
   const load = useCallback(() => (
     Promise.all([api('/api/ledger/blocks'), api('/api/ledger/verify')])
@@ -558,102 +573,80 @@ function LedgerExplorer() {
         setTotal(d.total)
         setValidation(v)
       })
-      .catch(() => { /* leave previous data */ })
-      .finally(() => setLoading(false))
+      .catch(() => setBlocks(b => b ?? []))
+      .finally(() => setBusy(false))
   ), [])
 
   useEffect(() => { load() }, [load])
 
+  const altered = validation && !validation.valid
+    ? [...new Set(validation.errors.map(e => `#${e.block_index}`))].join(', ')
+    : ''
+
   return (
-    <div className="animate-in">
-      <PageHeader title="Audit Ledger"
-        subtitle="Tamper-evident hash chain — every decryption event is recorded">
-        <button className="btn btn-secondary" onClick={() => { setLoading(true); load() }} disabled={loading}>
-          {loading ? '⏳' : '↻'} Refresh & Verify
+    <>
+      <PageHeader title="Activity Log"
+        subtitle="Every time a document is opened, it is permanently recorded here.">
+        <button className="btn btn-secondary" onClick={() => { setBusy(true); load() }} disabled={busy}>
+          {busy ? 'Checking…' : 'Check log'}
         </button>
       </PageHeader>
 
-      <div className="stats-grid">
-        <div className="stat-card">
-          <div className="stat-icon">📦</div>
-          <div className="stat-value">{total}</div>
-          <div className="stat-label">Total Blocks</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-icon">{validation ? (validation.valid ? '✅' : '❌') : '⛓️'}</div>
-          <div className={`stat-value ${validation && !validation.valid ? 'bad' : ''}`}>
-            {validation ? (validation.valid ? 'Intact' : `${validation.errors?.length} errors`) : '…'}
-          </div>
-          <div className="stat-label">Chain Integrity</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-icon">🔗</div>
-          <div className="stat-value">SHA-256</div>
-          <div className="stat-label">Hash Algorithm</div>
-        </div>
-      </div>
+      {validation && (validation.valid ? (
+        <Notice tone="success" title="Log verified">
+          All {validation.blocks_checked} records are intact. Nothing has been changed or removed.
+        </Notice>
+      ) : (
+        <Notice tone="error" title="The log has been tampered with">
+          Record{validation.errors.length > 1 ? 's' : ''} {altered} no longer match{validation.errors.length > 1 ? '' : 'es'} the original. Treat this system as compromised.
+        </Notice>
+      ))}
 
-      {validation && !validation.valid && (
-        <div className="alert alert-danger" role="alert">
-          <span>❌</span>
-          <span>
-            Tampering detected in block{validation.errors.length > 1 ? 's' : ''}{' '}
-            {[...new Set(validation.errors.map(e => `#${e.block_index}`))].join(', ')}.
-          </span>
-        </div>
-      )}
-
-      <div className="card flush">
-        <div className="card-header padded">
-          <span className="card-title">Decryption Events</span>
-          {total > blocks.length && <span className="hint">Showing latest {blocks.length} of {total}</span>}
-        </div>
-
-        {blocks.length === 0 ? (
-          <div className="empty-state"><div className="icon">⛓️</div><p>No blocks yet. Decrypt a document to create the first block.</p></div>
+      <section className="panel flush">
+        {blocks === null ? (
+          <Empty>Loading…</Empty>
+        ) : blocks.length === 0 ? (
+          <Empty>No documents have been opened yet.</Empty>
         ) : (
           <div className="table-wrap">
-            <table className="ledger-table">
+            <table className="table">
               <thead>
                 <tr>
-                  <th>#</th>
-                  <th>Timestamp</th>
-                  <th>Recipient</th>
+                  <th>Record</th>
+                  <th>Date &amp; time</th>
+                  <th>Opened by</th>
                   <th>Document</th>
-                  <th>Watermark ID</th>
-                  <th>Block Hash</th>
-                  <th>Prev Hash</th>
                 </tr>
               </thead>
               <tbody>
                 {blocks.map(b => (
                   <tr key={b.block_index}>
-                    <td>{b.block_index}</td>
+                    <td className="muted">#{b.block_index}</td>
                     <td className="nowrap">{formatTime(b.timestamp)}</td>
-                    <td>{b.recipient_id}</td>
-                    <td className="mono">{b.doc_id || '—'}</td>
-                    <td className="mono" title={b.watermark_id}>{shortHash(b.watermark_id, 12)}</td>
-                    <td className="mono" title={b.block_hash}>{shortHash(b.block_hash)}</td>
-                    <td className="mono" title={b.prev_hash}>{shortHash(b.prev_hash)}</td>
+                    <td>{userName(b.recipient_id)}</td>
+                    <td>{docName(b.doc_id) || <span className="muted">Unavailable</span>}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         )}
-      </div>
-    </div>
+        {blocks && total > blocks.length && (
+          <div className="table-foot muted small">Showing the latest {blocks.length} of {total} records</div>
+        )}
+      </section>
+    </>
   )
 }
 
 // ─── App shell ──────────────────────────────────────────────────────
 const PAGES = [
-  { id: 'dashboard', label: 'Dashboard', icon: '📊', component: Dashboard, section: 'Operations' },
-  { id: 'register', label: 'Register Users', icon: '👤', component: Register, section: 'Operations' },
-  { id: 'distribute', label: 'Distribute', icon: '📤', component: Distribute, section: 'Operations' },
-  { id: 'decrypt', label: 'Decrypt', icon: '🔓', component: Decrypt, section: 'Operations' },
-  { id: 'investigate', label: 'Investigate', icon: '🔍', component: Investigate, section: 'Forensics' },
-  { id: 'ledger', label: 'Audit Ledger', icon: '⛓️', component: LedgerExplorer, section: 'Forensics' },
+  { id: 'overview', label: 'Overview', component: Overview },
+  { id: 'recipients', label: 'Recipients', component: Recipients },
+  { id: 'share', label: 'Share Document', component: ShareDocument, section: 'Documents' },
+  { id: 'open', label: 'Open Document', component: OpenDocument, section: 'Documents' },
+  { id: 'trace', label: 'Trace Leak', component: TraceLeak, section: 'Investigation' },
+  { id: 'ledger', label: 'Activity Log', component: ActivityLog, section: 'Investigation' },
 ]
 
 const ZOOM_STEPS = [0.9, 1, 1.1, 1.25]
@@ -670,7 +663,7 @@ function savePref(key, value) {
 }
 
 export default function App() {
-  const [page, setPage] = useState('dashboard')
+  const [page, setPage] = useState('overview')
   const [zoomIdx, setZoomIdx] = useState(() => loadPref('zoom', 1))
   const [highContrast, setHighContrast] = useState(() => loadPref('contrast', false))
 
@@ -679,70 +672,52 @@ export default function App() {
 
   const current = PAGES.find(p => p.id === page) || PAGES[0]
   const CurrentPage = current.component
-  const sections = [...new Set(PAGES.map(p => p.section))]
+  const groups = [...new Set(PAGES.map(p => p.section ?? ''))]
 
   return (
     <div className="app" data-contrast={highContrast ? 'high' : undefined}>
-      <header className="classification-bar">
-        <span className="left">🔒 Secure Document Distribution System</span>
-        <span className="banner-classification">RESTRICTED</span>
-        <span className="right">Ministry of Defence · Indian Navy (WESEE)</span>
-      </header>
-      <div className="tricolor-bar" />
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark" aria-hidden="true">N</div>
+          <span className="brand-name">NISHAN</span>
+        </div>
 
-      <div className="app-content">
-        <aside className="sidebar">
-          <div className="sidebar-logo">
-            <div className="logo-icon">N</div>
-            <div>
-              <h1>NISHAN</h1>
-              <div className="badge">DOCUMENT SECURITY</div>
+        <nav aria-label="Main">
+          {groups.map(section => (
+            <div key={section || 'main'} className="nav-group">
+              {section && <div className="nav-section">{section}</div>}
+              {PAGES.filter(p => (p.section ?? '') === section).map(p => (
+                <button type="button" key={p.id} className={`nav-item ${page === p.id ? 'active' : ''}`}
+                  aria-current={page === p.id ? 'page' : undefined} onClick={() => setPage(p.id)}>
+                  {p.label}
+                </button>
+              ))}
             </div>
-          </div>
+          ))}
+        </nav>
 
-          <nav aria-label="Main">
-            {sections.map(section => (
-              <div key={section}>
-                <div className="nav-section">{section}</div>
-                <ul className="nav-items">
-                  {PAGES.filter(p => p.section === section).map(p => (
-                    <li key={p.id}>
-                      <button type="button" className={`nav-item ${page === p.id ? 'active' : ''}`}
-                        aria-current={page === p.id ? 'page' : undefined} onClick={() => setPage(p.id)}>
-                        <span className="icon">{p.icon}</span> {p.label}
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ))}
-          </nav>
-
-          <div className="sidebar-footer">
-            <div className="a11y-controls" role="group" aria-label="Display settings">
-              <button type="button" title="Smaller text" aria-label="Smaller text"
-                disabled={zoomIdx === 0} onClick={() => setZoomIdx(i => i - 1)}>A−</button>
-              <button type="button" title="Reset text size" aria-label="Reset text size"
-                onClick={() => setZoomIdx(1)}>A</button>
-              <button type="button" title="Larger text" aria-label="Larger text"
-                disabled={zoomIdx === ZOOM_STEPS.length - 1} onClick={() => setZoomIdx(i => i + 1)}>A+</button>
-              <button type="button" title="High contrast" aria-label="High contrast"
-                aria-pressed={highContrast} className={highContrast ? 'on' : ''}
-                onClick={() => setHighContrast(c => !c)}>◐</button>
-            </div>
-            <div className="org">
-              <div>Cryptographic Attribution &amp;</div>
-              <div>Immutable Decryption Provenance</div>
-            </div>
+        <div className="sidebar-footer">
+          <div className="nav-section">Display</div>
+          <div className="display-controls" role="group" aria-label="Display settings">
+            <button type="button" aria-label="Smaller text" title="Smaller text"
+              disabled={zoomIdx === 0} onClick={() => setZoomIdx(i => i - 1)}>A−</button>
+            <button type="button" aria-label="Default text size" title="Default text size"
+              onClick={() => setZoomIdx(1)}>A</button>
+            <button type="button" aria-label="Larger text" title="Larger text"
+              disabled={zoomIdx === ZOOM_STEPS.length - 1} onClick={() => setZoomIdx(i => i + 1)}>A+</button>
           </div>
-        </aside>
+          <label className="toggle">
+            <input type="checkbox" checked={highContrast} onChange={e => setHighContrast(e.target.checked)} />
+            <span>High contrast</span>
+          </label>
+        </div>
+      </aside>
 
-        <main className="main">
-          <div className="main-inner" style={{ zoom: ZOOM_STEPS[zoomIdx] ?? 1 }}>
-            <CurrentPage key={current.id} />
-          </div>
-        </main>
-      </div>
+      <main className="main">
+        <div className="main-inner" style={{ zoom: ZOOM_STEPS[zoomIdx] ?? 1 }}>
+          <CurrentPage key={current.id} onNavigate={setPage} />
+        </div>
+      </main>
     </div>
   )
 }
